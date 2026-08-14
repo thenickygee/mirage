@@ -1,3 +1,5 @@
+<img width="986" height="197" alt="mirage-wordstamp" src="https://github.com/user-attachments/assets/134c9746-ee95-49e2-937e-ff5632186b60" />
+
 # Mirage
 
 A terminal UI for managing and browsing your [opencode](https://opencode.ai) configuration — agents, skills, commands, tools, and sessions — from a keyboard-driven interface.
