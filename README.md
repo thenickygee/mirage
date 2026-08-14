@@ -2,11 +2,6 @@
 
 A terminal UI for managing and browsing your [opencode](https://opencode.ai) configuration — agents, skills, commands, tools, and sessions — from a keyboard-driven interface.
 
-<img width="1533" height="248" alt="image" src="https://github.com/user-attachments/assets/22af765a-90de-461d-ab2f-eb7044b4f354" />
-
-<img width="1412" height="1083" alt="image" src="https://github.com/user-attachments/assets/08ecc15d-9c27-4672-8567-82fe612219e0" />
-
-
 
 ## Install
 
@@ -80,12 +75,6 @@ The app reads configuration from the standard opencode directories:
 - Which-key leader menu (`space`)
 - Markdown rendering in detail panes via glamour
 
-<img width="1412" height="1083" alt="agents" src="https://github.com/user-attachments/assets/26f8c934-797c-477b-a01d-2049d0ace2a7" />
--
-<img width="1412" height="1083" alt="skills" src="https://github.com/user-attachments/assets/33c2f7eb-6719-4d65-9c72-129feb885090" />
-
-
-
 ## Server Mode
 
 Mirage can connect to one or more running OpenCode instances to show live agent activity and handle permission requests in real time.
@@ -147,12 +136,10 @@ Each instance entry shows:
 - **CTX bar** — a mini fill bar showing context window usage for the most recent turn
 
 Example pending questions status:
-<img width="448" height="164" alt="CleanShot 2026-05-02 at 19 50 23" src="https://github.com/user-attachments/assets/cb226048-bfc4-49a0-84be-9f5bcd9a388b" />
 
 
 #### Instance detail (right pane)
 
-<img width="1416" height="1230" alt="instances" src="https://github.com/user-attachments/assets/d4e742d7-e319-4eb2-aac7-428031210c09" />
 
 Selecting an instance opens the detail pane:
 
@@ -226,7 +213,6 @@ Press `i` to enter insert mode and send a message directly to the selected insta
 
 The leader menu is a which-key style overlay activated by pressing `space`. It shows context-sensitive shortcuts depending on the active tab.
 
-<img width="1412" height="1083" alt="image" src="https://github.com/user-attachments/assets/3250a63b-c837-47db-8ec4-2f5bbaa8aba7" />
 
 #### Navigation
 
