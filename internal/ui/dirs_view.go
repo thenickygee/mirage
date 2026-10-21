@@ -1,4 +1,3 @@
-
 package ui
 
 import (
@@ -85,26 +84,28 @@ func (v *dirsView) rebuild() {
 		}
 	}
 
-	// Mark active sessions
+	// Mark active sessions (use index to avoid O(sessions × active) scan)
+	sessionByID := make(map[string]*session.Session, len(v.allSessions))
+	for _, s := range v.allSessions {
+		sessionByID[s.ID] = s
+	}
 	for sessionID, agentName := range v.activeSessions {
-		// Find which directory this session belongs to
-		for _, s := range v.allSessions {
-			if s.ID == sessionID {
-				dir := s.Directory
-				if dir == "" {
-					dir = "."
+		s, ok := sessionByID[sessionID]
+		if !ok {
+			continue
+		}
+		dir := s.Directory
+		if dir == "" {
+			dir = "."
+		}
+		if e, ok := byDir[dir]; ok {
+			e.activeSesCnt++
+			if e.activeAgent == "" {
+				if agentName != "" {
+					e.activeAgent = agentName
+				} else {
+					e.activeAgent = "running"
 				}
-				if e, ok := byDir[dir]; ok {
-					e.activeSesCnt++
-					if e.activeAgent == "" {
-						if agentName != "" {
-							e.activeAgent = agentName
-						} else {
-							e.activeAgent = "running"
-						}
-					}
-				}
-				break
 			}
 		}
 	}

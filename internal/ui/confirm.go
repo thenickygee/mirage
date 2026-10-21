@@ -4,18 +4,19 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 type confirmModel struct {
 	active  bool
 	title   string
 	message string
-	onYes   func()
+	onYes   func() tea.Cmd
 	width   int
 	height  int
 }
 
-func newConfirm(title, message string, onYes func()) confirmModel {
+func newConfirm(title, message string, onYes func() tea.Cmd) confirmModel {
 	return confirmModel{
 		active:  true,
 		title:   title,
@@ -24,11 +25,13 @@ func newConfirm(title, message string, onYes func()) confirmModel {
 	}
 }
 
-func (c *confirmModel) confirm() {
+func (c *confirmModel) confirm() tea.Cmd {
+	var cmd tea.Cmd
 	if c.onYes != nil {
-		c.onYes()
+		cmd = c.onYes()
 	}
 	c.active = false
+	return cmd
 }
 
 func (c *confirmModel) cancel() {

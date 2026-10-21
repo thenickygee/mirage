@@ -28,6 +28,12 @@ type toolView struct {
 	detail        viewport.Model
 	detailFocused bool
 	detailLastKey string
+
+	// Syntax-highlight cache — avoids re-running chroma tokenisation on every refresh.
+	cachedHLToolID  string
+	cachedHLContent string
+	cachedHLExt     string
+	cachedHLResult  string
 }
 
 func newToolView(tools []*tool.Tool) toolView {
@@ -109,7 +115,7 @@ func (v *toolView) renderTool(t *tool.Tool) string {
 		sb.WriteString("\n")
 		sb.WriteString(StyleSectionHeader.Render("SOURCE") + "\n")
 		sb.WriteString(StyleSeparator.Render(strings.Repeat("╌", v.detail.Width)) + "\n")
-		highlighted := highlightSource(t.Content, t.Ext)
+		highlighted := v.cachedHighlight(t)
 		if highlighted != "" {
 			for _, line := range strings.Split(highlighted, "\n") {
 				sb.WriteString("  " + line + "\n")
@@ -292,6 +298,18 @@ func (v toolView) renderDetailPane() string {
 		borderStyle = StyleActiveBorder
 	}
 	return borderStyle.Width(v.detailW).Height(v.height - 2).Render(v.detail.View())
+}
+
+func (v *toolView) cachedHighlight(t *tool.Tool) string {
+	if v.cachedHLToolID == t.ID && v.cachedHLContent == t.Content && v.cachedHLExt == t.Ext && v.cachedHLResult != "" {
+		return v.cachedHLResult
+	}
+	result := highlightSource(t.Content, t.Ext)
+	v.cachedHLToolID = t.ID
+	v.cachedHLContent = t.Content
+	v.cachedHLExt = t.Ext
+	v.cachedHLResult = result
+	return result
 }
 
 func highlightSource(content, ext string) string {

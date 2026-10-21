@@ -1,4 +1,3 @@
-
 package ui
 
 import (
@@ -6,6 +5,7 @@ import (
 	"image/color"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -47,13 +47,16 @@ type overviewModel struct {
 	listOnly         bool   // when true, only show list pane — skip detail fetching/rendering
 	display          config.InstanceDisplay
 
-	// Markdown render cache: skip expensive re-render when output hasn't changed.
-	cachedOutputLen     int
-	cachedOutputLastTxt string
-	cachedRenderedBody  string
-	cachedRenderWidth   int
-	cachedRenderSession string
-	rowToCursor         []int // maps visible content row to cursor index (-1 for non-item rows)
+	// Per-block markdown render cache: only re-renders blocks that actually changed.
+	cachedBlocks     []cachedBlock
+	cachedBlockSess  string
+	cachedBlockWidth int
+	rowToCursor      []int // maps visible content row to cursor index (-1 for non-item rows)
+
+	// Pre-computed ordering cache — rebuilt in refresh() so hot-path methods
+	// (selected, selectedServer, renderList, Update) don't re-sort every call.
+	cachedOrdered []server.ConnectedServerInfo
+	cachedGroups  []serverGroup
 }
 
 func newOverviewModel() overviewModel {
@@ -93,7 +96,9 @@ func (m *overviewModel) setSize(w, h int) {
 
 func (m *overviewModel) refresh(connectedServers []server.ConnectedServerInfo) {
 	m.connectedServers = connectedServers
-	ordered := orderedServers(m.connectedServers)
+	m.cachedGroups = buildServerGroups(connectedServers)
+	m.cachedOrdered = orderedServersFromGroups(m.cachedGroups)
+	ordered := m.cachedOrdered
 	if m.pendingSelectURL != "" {
 		for i, srv := range ordered {
 			if srv.URL == m.pendingSelectURL {
@@ -124,20 +129,18 @@ func (m *overviewModel) selectByURL(url string) {
 }
 
 func (m *overviewModel) selectedServer() *server.ConnectedServerInfo {
-	ordered := orderedServers(m.connectedServers)
-	if len(ordered) == 0 || m.cursor >= len(ordered) {
+	if len(m.cachedOrdered) == 0 || m.cursor >= len(m.cachedOrdered) {
 		return nil
 	}
-	srv := ordered[m.cursor]
+	srv := m.cachedOrdered[m.cursor]
 	return &srv
 }
 
 func (m *overviewModel) selected() *server.TrackedSession {
-	ordered := orderedServers(m.connectedServers)
-	if len(ordered) == 0 || m.cursor >= len(ordered) {
+	if len(m.cachedOrdered) == 0 || m.cursor >= len(m.cachedOrdered) {
 		return nil
 	}
-	srv := ordered[m.cursor]
+	srv := m.cachedOrdered[m.cursor]
 	if len(srv.Sessions) == 0 {
 		return nil
 	}
@@ -227,30 +230,18 @@ func (m *overviewModel) refreshDetail() {
 	m.detail.Height = m.height - 4 - headerLines - inputHeight
 
 	// Build scrollable content (output only).
-	// Use cached rendered markdown if output hasn't changed.
-	outputLen := len(sel.OutputLines)
+	// Use per-block cached rendered markdown to avoid re-rendering unchanged blocks.
 	detailW := m.detail.Width
 	if detailW < 10 {
 		detailW = 60
 	}
-	lastTxt := ""
-	if outputLen > 0 {
-		lastTxt = sel.OutputLines[outputLen-1].Text
-	}
-	cacheHit := m.cachedRenderSession == sel.ID &&
-		m.cachedOutputLen == outputLen &&
-		m.cachedOutputLastTxt == lastTxt &&
-		m.cachedRenderWidth == detailW &&
-		outputLen > 0
 
 	var sb strings.Builder
 	sb.WriteString(StyleSectionHeader.Render("OUTPUT") + "\n")
 	sb.WriteString(StyleSeparator.Render(strings.Repeat("╌", m.detail.Width)) + "\n")
 
-	if cacheHit {
-		sb.WriteString(m.cachedRenderedBody)
-	} else if len(sel.OutputLines) > 0 {
-		// Group consecutive lines by role and render each block with role-appropriate styling.
+	if len(sel.OutputLines) > 0 {
+		// Group consecutive lines by role into blocks.
 		type block struct {
 			role  string
 			lines []string
@@ -264,12 +255,22 @@ func (m *overviewModel) refreshDetail() {
 			}
 		}
 
+		// Per-block cache: only re-render blocks that are new or changed.
+		cacheValid := m.cachedBlockSess == sel.ID && m.cachedBlockWidth == detailW
+		var newCached []cachedBlock
 		var body strings.Builder
-		for _, b := range blocks {
+		for i, b := range blocks {
 			content := strings.Join(b.lines, "\n")
-			rendered := renderMarkdown(content, detailW)
+			var rendered string
+			if cacheValid && i < len(m.cachedBlocks) &&
+				m.cachedBlocks[i].role == b.role &&
+				m.cachedBlocks[i].content == content {
+				rendered = m.cachedBlocks[i].rendered
+			} else {
+				rendered = renderMarkdown(content, detailW)
+			}
+			newCached = append(newCached, cachedBlock{role: b.role, content: content, rendered: rendered})
 			if b.role == "user" {
-				// User messages: left border divider to distinguish from assistant
 				rendered = strings.TrimSpace(rendered)
 				bordered := lipgloss.NewStyle().
 					BorderStyle(lipgloss.ThickBorder()).
@@ -279,17 +280,16 @@ func (m *overviewModel) refreshDetail() {
 					Render(rendered)
 				body.WriteString(bordered + "\n\n")
 			} else {
-				// Assistant messages: no decoration
 				body.WriteString(rendered + "\n")
 			}
 		}
-		m.cachedRenderedBody = body.String()
-		m.cachedRenderSession = sel.ID
-		m.cachedOutputLen = outputLen
-		m.cachedOutputLastTxt = lastTxt
-		m.cachedRenderWidth = detailW
-		sb.WriteString(m.cachedRenderedBody)
+		m.cachedBlocks = newCached
+		m.cachedBlockSess = sel.ID
+		m.cachedBlockWidth = detailW
+		sb.WriteString(body.String())
 	} else {
+		m.cachedBlocks = nil
+		m.cachedBlockSess = ""
 		if sel.Busy {
 			sb.WriteString(StyleDim.Render("  waiting for output...") + "\n")
 		} else {
@@ -314,8 +314,7 @@ func (m overviewModel) Update(msg tea.Msg) (overviewModel, tea.Cmd) {
 				m.detail, cmd = m.detail.Update(msg)
 				return m, cmd
 			}
-			ordered := orderedServers(m.connectedServers)
-			n := len(ordered)
+			n := len(m.cachedOrdered)
 			if msg.Button == tea.MouseButtonWheelUp && m.cursor > 0 {
 				m.cursor--
 				m.refreshDetail()
@@ -455,7 +454,7 @@ func (m overviewModel) Update(msg tea.Msg) (overviewModel, tea.Cmd) {
 			}
 		}
 
-		n := len(orderedServers(m.connectedServers))
+		n := len(m.cachedOrdered)
 		visibleRows := (m.height - 6) / 6
 		if visibleRows < 1 {
 			visibleRows = 1
@@ -527,6 +526,20 @@ func OpenOverviewSessionCmd(ts *server.TrackedSession, serverURL string) tea.Cmd
 	})
 }
 
+// sourceKindBadge returns a short tag ("OC"/"CC") identifying the source kind
+// for an instance row. Unknown kinds render no badge so the layout stays
+// stable.
+func sourceKindBadge(kind string) string {
+	switch kind {
+	case "claude":
+		return StyleBadgeSourceCC.Render("CC")
+	case "opencode":
+		return StyleBadgeSourceOC.Render("OC")
+	default:
+		return ""
+	}
+}
+
 func projectName(srv server.ConnectedServerInfo) string {
 	for _, ts := range srv.Sessions {
 		if ts.Directory != "" {
@@ -555,6 +568,13 @@ type serverGroup struct {
 	dir     string // "" means ungrouped
 	name    string // display name (filepath.Base of dir)
 	servers []server.ConnectedServerInfo
+}
+
+// cachedBlock stores a single rendered output block for per-block markdown caching.
+type cachedBlock struct {
+	role     string
+	content  string
+	rendered string
 }
 
 // buildServerGroups returns an ordered list of groups derived from servers.
@@ -586,16 +606,8 @@ func buildServerGroups(servers []server.ConnectedServerInfo) []serverGroup {
 		}
 	}
 	// Sort for stable ordering.
-	for i := 1; i < len(multiDirs); i++ {
-		for j := i; j > 0 && multiDirs[j] < multiDirs[j-1]; j-- {
-			multiDirs[j], multiDirs[j-1] = multiDirs[j-1], multiDirs[j]
-		}
-	}
-	for i := 1; i < len(soloDirs); i++ {
-		for j := i; j > 0 && soloDirs[j] < soloDirs[j-1]; j-- {
-			soloDirs[j], soloDirs[j-1] = soloDirs[j-1], soloDirs[j]
-		}
-	}
+	sort.Strings(multiDirs)
+	sort.Strings(soloDirs)
 
 	for _, d := range multiDirs {
 		groups = append(groups, serverGroup{
@@ -619,14 +631,19 @@ func buildServerGroups(servers []server.ConnectedServerInfo) []serverGroup {
 	return groups
 }
 
-// orderedServers returns the flat list of servers in grouped display order.
-func orderedServers(servers []server.ConnectedServerInfo) []server.ConnectedServerInfo {
-	groups := buildServerGroups(servers)
+// orderedServersFromGroups flattens groups into a single slice.
+func orderedServersFromGroups(groups []serverGroup) []server.ConnectedServerInfo {
 	var out []server.ConnectedServerInfo
 	for _, g := range groups {
 		out = append(out, g.servers...)
 	}
 	return out
+}
+
+// orderedServers returns the flat list of servers in grouped display order.
+func orderedServers(servers []server.ConnectedServerInfo) []server.ConnectedServerInfo {
+	groups := buildServerGroups(servers)
+	return orderedServersFromGroups(groups)
 }
 
 func (m *overviewModel) renderList(spinFrame int) string {
@@ -654,11 +671,10 @@ func (m *overviewModel) renderList(spinFrame int) string {
 	// Reset rowToCursor: first 2 rows are title+separator (non-clickable)
 	m.rowToCursor = []int{-1, -1}
 
-	ordered := orderedServers(m.connectedServers)
+	ordered := m.cachedOrdered
+	groups := m.cachedGroups
 
 	if len(ordered) > 0 {
-		groups := buildServerGroups(m.connectedServers)
-
 		// Build a flat rendering plan: items are either group headers or instance entries.
 		// We also need to map flat cursor index -> group/server.
 		type renderItem struct {
@@ -717,7 +733,7 @@ func (m *overviewModel) renderList(spinFrame int) string {
 			}
 			innerIndent := indent + "  "
 
-			name := truncate(projectName(*srv), innerW-6)
+			name := truncate(projectName(*srv), innerW-9)
 			selected := item.idx == m.cursor
 
 			// Determine the active session for this server.
@@ -792,15 +808,18 @@ func (m *overviewModel) renderList(spinFrame int) string {
 				}
 				return strings.Repeat(" ", n)
 			}
+			// Source-kind badge so users can tell opencode ("OC") and claude
+			// ("CC") instances apart in the overview.
+			kindBadge := sourceKindBadge(srv.Kind)
 			headerRow := func(dotStr, labelStr string) string {
 				if ctxBar == "" {
-					return selSp(len(indent)) + dotStr + selSp(1) + labelStr
+					return selSp(len(indent)) + dotStr + selSp(1) + labelStr + selSp(1) + kindBadge
 				}
-				gap := innerW - len(indent) - 1 /*dot*/ - 1 /*space*/ - lipgloss.Width(labelStr) - lipgloss.Width(ctxBar)
+				gap := innerW - len(indent) - 1 /*dot*/ - 1 /*space*/ - lipgloss.Width(labelStr) - lipgloss.Width(kindBadge) - 1 /*space*/ - lipgloss.Width(ctxBar)
 				if gap < 1 {
 					gap = 1
 				}
-				return selSp(len(indent)) + dotStr + selSp(1) + labelStr + selSp(gap) + ctxBar
+				return selSp(len(indent)) + dotStr + selSp(1) + labelStr + selSp(1) + kindBadge + selSp(gap) + ctxBar
 			}
 
 			if selected {
@@ -851,10 +870,17 @@ func (m *overviewModel) renderList(spinFrame int) string {
 					if agent == "" {
 						agent = "agent"
 					}
-					statusStr := spinnerStyle.Render(" (running)")
-					spin := circleGlyphs[spinFrame%len(circleGlyphs)]
-					indicator := spinnerStyle.Render(spin)
 					agentStr := agentActiveStyle.Render(truncate("@"+agent, innerW-8))
+					var statusStr, indicator string
+					if activeTS.ToolState == "retrying" {
+						// Surface system/api_retry as a transient retry status.
+						statusStr = yellowDotStyle.Render(" (retrying)")
+						indicator = yellowDotStyle.Render("↻")
+					} else {
+						statusStr = spinnerStyle.Render(" (running)")
+						spin := circleGlyphs[spinFrame%len(circleGlyphs)]
+						indicator = spinnerStyle.Render(spin)
+					}
 					sectionRows = append(sectionRows, innerIndent+indicator+selSp(1)+agentStr+statusStr)
 					if activeTS.Title != "" {
 						sectionRows = append(sectionRows, innerIndent+mutedStyle.Render(truncate(server.DisplaySessionTitle(activeTS.Title), innerW-6)))

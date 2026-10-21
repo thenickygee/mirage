@@ -5,12 +5,16 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/thenickygee/mirage/internal/agent"
 	"github.com/thenickygee/mirage/internal/command"
 	"github.com/thenickygee/mirage/internal/server"
+	"github.com/thenickygee/mirage/internal/server/claude"
+	"github.com/thenickygee/mirage/internal/server/opencode"
 	"github.com/thenickygee/mirage/internal/skill"
 	"github.com/thenickygee/mirage/internal/tool"
 	"github.com/thenickygee/mirage/internal/ui"
@@ -41,11 +45,19 @@ Commands:
 Flags:
   -server <url>    OpenCode server URL (may be repeated)
   -no-mdns         Disable mDNS auto-discovery of OpenCode instances
+  -claude          Force-enable the Claude Code source (otherwise auto-enabled
+                   when claude is on $PATH and ANTHROPIC_API_KEY is set)
+  -claude-key <key>    ANTHROPIC_API_KEY for claude --bare (else $ANTHROPIC_API_KEY)
+  -claude-model <id>   Default model (else claude's default)
+  -claude-mode <mode>  Permission mode: acceptEdits (default) | dontAsk | default
+  -claude-tools <list> Comma-separated --allowedTools (default "Read,Edit,Bash,Glob,Grep")
+  -claude-prompt <text>  Initial prompt to launch a Claude session at startup
 
 Examples:
   mirage
   mirage -server http://localhost:4096
   mirage -no-mdns -server http://localhost:4096
+  mirage -claude -claude-key $ANTHROPIC_API_KEY -claude-prompt "summarize this folder"
 `, version)
 }
 
@@ -68,6 +80,12 @@ func main() {
 	var serverURLs multiFlag
 	flag.Var(&serverURLs, "server", "opencode server URL (may be repeated, e.g. --server http://localhost:4096)")
 	noMDNS := flag.Bool("no-mdns", false, "disable mDNS auto-discovery of opencode instances")
+	claudeEnabled := flag.Bool("claude", false, "enable the Claude Code source")
+	claudeKey := flag.String("claude-key", "", "ANTHROPIC_API_KEY for `claude --bare` (else read from $ANTHROPIC_API_KEY)")
+	claudeModel := flag.String("claude-model", "", "default model for claude sessions (else claude's default)")
+	claudeMode := flag.String("claude-mode", "acceptEdits", "permission mode for claude sessions: acceptEdits | dontAsk | default")
+	claudeTools := flag.String("claude-tools", "Read,Edit,Bash,Glob,Grep", "comma-separated --allowedTools list for claude sessions")
+	claudePrompt := flag.String("claude-prompt", "", "initial prompt to launch a Claude session at startup")
 	flag.Usage = printHelp
 	flag.Parse()
 
@@ -82,6 +100,7 @@ func main() {
 	pool := server.NewPool(func() {
 		p.Send(ui.PermissionsChangedMsg{})
 	})
+	pool.SetSourceFactory(opencode.NewSource)
 
 	// Add any explicitly specified servers.
 	for _, u := range serverURLs {
@@ -90,12 +109,43 @@ func main() {
 		}
 	}
 
+	// Register the Claude Code source. It launches sessions as
+	// `claude --bare -p` subprocesses and parses the stream-json output. See
+	// plans/claude-code-integration.md.
+	//
+	// Auto-enable whenever the `claude` CLI is on $PATH so mirage works with
+	// Claude and OpenCode simultaneously out of the box — the source stays
+	// out of the overview until it owns a session, so OpenCode-only users
+	// see no clutter. The -claude flag forces enable even when `claude`
+	// isn't on $PATH (to surface the missing-binary error explicitly).
+	// Launching without ANTHROPIC_API_KEY fails with a clear per-launch
+	// error rather than "no source available".
+	_, claudeLookErr := exec.LookPath("claude")
+	claudeOnPath := claudeLookErr == nil
+	if *claudeEnabled || claudeOnPath {
+		claudeKeyResolved := *claudeKey
+		if claudeKeyResolved == "" {
+			claudeKeyResolved = os.Getenv("ANTHROPIC_API_KEY")
+		}
+		tools := splitCSV(*claudeTools)
+		src := claude.NewSource(claude.Config{
+			APIKey:         claudeKeyResolved,
+			Model:          *claudeModel,
+			PermissionMode: *claudeMode,
+			AllowedTools:   tools,
+			InitialPrompt:  *claudePrompt,
+		}, pool.NotifyChange)
+		if err := pool.AddSource(src); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not enable Claude source: %v\n", err)
+		}
+	}
+
 	// Start mDNS discovery by default.
 	var cancel context.CancelFunc
 	if !*noMDNS {
 		ctx, c := context.WithCancel(context.Background())
 		cancel = c
-		go server.Discover(ctx, pool)
+		go opencode.Discover(ctx, pool)
 	}
 
 	// Watch agent config files for changes and hot-reload the agents list.
@@ -149,4 +199,21 @@ func main() {
 		cancel()
 	}
 	pool.Close()
+}
+
+// splitCSV splits a comma-separated string into trimmed fields, dropping
+// empty entries. Used to parse -claude-tools.
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

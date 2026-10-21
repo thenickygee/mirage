@@ -45,6 +45,28 @@ var tabNames = map[tabID]string{
 	tabDirs:     " DIRS ",
 }
 
+// Precomputed tab label data for renderTabBar — avoids repeated TrimSpace/rune
+// extraction and lipgloss.Width calls on every render.
+var (
+	tabLabelStrs [tabCount]string // trimmed labels
+	tabLabelLens [tabCount]int    // plain-text width of each label
+	tabAbbrevs   [tabCount]string // first rune of each label
+	tabSepW      int              // width of the join separator
+)
+
+func init() {
+	for i := tabID(0); i < tabCount; i++ {
+		label := strings.TrimSpace(tabNames[i])
+		tabLabelStrs[i] = label
+		tabLabelLens[i] = lipgloss.Width(label)
+		if len(label) > 0 {
+			tabAbbrevs[i] = string([]rune(label)[0:1])
+		}
+	}
+	sep := StyleDim.Render("·")
+	tabSepW = lipgloss.Width("  " + sep + "  ")
+}
+
 type paneState int
 
 const (
@@ -55,41 +77,43 @@ const (
 )
 
 type App struct {
-	tab              tabID
-	pane             paneState
-	list             agentList
-	detail           detailPane
-	promptView       viewport.Model
-	promptLastKey    string
-	form             formModel
-	overviewTab      overviewModel
-	sessionTab       sessionView
-	dirsTab          dirsView
-	skillTab         skillView
-	cmdTab           commandView
-	toolTab          toolView
-	leader           leaderState
-	finder           finderModel
-	confirm          confirmModel
-	dirPicker        dirPickerModel
-	settings         settingsModel
-	accentName       string
-	instanceDisplay  config.InstanceDisplay
-	width            int
-	height           int
-	statusMsg        string
-	statusErr        bool
-	showSplash       bool
-	splashPhase      int // 0=text only, 1=robot only, 2=both (flash)
-	splashFrame      int
-	splashFlashing   bool
-	splashFlashFrame int
-	pool             *server.Pool
-	activeAgents     map[string]bool
-	spinFrame        int
-	fetchingOutput   bool
-	lastStateVersion uint64           // last pool.StateVersion() seen; gates expensive refresh work
-	tabZones         [tabCount][2]int // [start, end] x-positions for each tab
+	tab                  tabID
+	pane                 paneState
+	list                 agentList
+	detail               detailPane
+	promptView           viewport.Model
+	promptLastKey        string
+	form                 formModel
+	overviewTab          overviewModel
+	sessionTab           sessionView
+	dirsTab              dirsView
+	skillTab             skillView
+	cmdTab               commandView
+	toolTab              toolView
+	leader               leaderState
+	finder               finderModel
+	confirm              confirmModel
+	dirPicker            dirPickerModel
+	claudeLauncher       claudeLauncherModel
+	settings             settingsModel
+	accentName           string
+	instanceDisplay      config.InstanceDisplay
+	width                int
+	height               int
+	statusMsg            string
+	statusErr            bool
+	showSplash           bool
+	splashPhase          int // 0=text only, 1=robot only, 2=both (flash)
+	splashFrame          int
+	splashFlashing       bool
+	splashFlashFrame     int
+	pool                 *server.Pool
+	activeAgents         map[string]bool
+	spinFrame            int
+	fetchingOutput       bool
+	lastStateVersion     uint64           // last pool.StateVersion() seen; gates expensive refresh work
+	tabZones             [tabCount][2]int // [start, end] x-positions for each tab
+	pendingSelectAgentID string           // agent ID to auto-select after async reload
 }
 
 type PermissionsChangedMsg struct{}
@@ -102,6 +126,78 @@ type CommandChangedMsg struct{}
 type ToolChangedMsg struct{}
 
 type clearUpdateMsg struct{}
+
+// Async-loaded messages — avoid blocking the main thread on disk IO / subprocesses.
+type agentsLoadedMsg struct {
+	agents []*agent.Agent
+	err    error
+}
+
+type skillsLoadedMsg struct {
+	skills []*skill.Skill
+	err    error
+}
+
+type commandsLoadedMsg struct {
+	commands []*command.Command
+	err      error
+}
+
+type toolsLoadedMsg struct {
+	tools []*tool.Tool
+	err   error
+}
+
+type sessionsLoadedMsg struct {
+	sessions []*session.Session
+	err      error
+}
+
+type permissionRespondedMsg struct {
+	permType string
+	response string
+	err      error
+}
+
+type sourceAddedMsg struct {
+	url string
+	err error
+}
+
+func loadAgentsCmd() tea.Cmd {
+	return func() tea.Msg {
+		agents, err := agent.LoadAll()
+		return agentsLoadedMsg{agents: agents, err: err}
+	}
+}
+
+func loadSkillsCmd() tea.Cmd {
+	return func() tea.Msg {
+		skills, err := skill.LoadAll()
+		return skillsLoadedMsg{skills: skills, err: err}
+	}
+}
+
+func loadCommandsCmd() tea.Cmd {
+	return func() tea.Msg {
+		commands, err := command.LoadAll()
+		return commandsLoadedMsg{commands: commands, err: err}
+	}
+}
+
+func loadToolsCmd() tea.Cmd {
+	return func() tea.Msg {
+		tools, err := tool.LoadAll()
+		return toolsLoadedMsg{tools: tools, err: err}
+	}
+}
+
+func loadSessionsCmd() tea.Cmd {
+	return func() tea.Msg {
+		sessions, err := session.LoadAll()
+		return sessionsLoadedMsg{sessions: sessions, err: err}
+	}
+}
 
 func (a *App) SetPool(pool *server.Pool) {
 	a.pool = pool
@@ -198,45 +294,20 @@ func (a *App) Init() tea.Cmd {
 	return tea.Batch(loadStatsCmd(), statsTickCmd(), sessionReloadTick())
 }
 
-func (a *App) reloadAgents() {
-	agents, err := agent.LoadAll()
-	if err != nil {
-		a.statusMsg = "reload error: " + err.Error()
-		a.statusErr = true
-		return
-	}
-	a.list.setAgents(agents)
-	a.detail.setAgent(a.list.selected())
+func (a *App) reloadAgents() tea.Cmd {
+	return loadAgentsCmd()
 }
 
-func (a *App) reloadSkills() {
-	skills, err := skill.LoadAll()
-	if err != nil {
-		a.statusMsg = "reload error: " + err.Error()
-		a.statusErr = true
-		return
-	}
-	a.skillTab.skills = skills
+func (a *App) reloadSkills() tea.Cmd {
+	return loadSkillsCmd()
 }
 
-func (a *App) reloadCommands() {
-	commands, err := command.LoadAll()
-	if err != nil {
-		a.statusMsg = "reload error: " + err.Error()
-		a.statusErr = true
-		return
-	}
-	a.cmdTab.commands = commands
+func (a *App) reloadCommands() tea.Cmd {
+	return loadCommandsCmd()
 }
 
-func (a *App) reloadTools() {
-	tools, err := tool.LoadAll()
-	if err != nil {
-		a.statusMsg = "reload error: " + err.Error()
-		a.statusErr = true
-		return
-	}
-	a.toolTab.tools = tools
+func (a *App) reloadTools() tea.Cmd {
+	return loadToolsCmd()
 }
 
 func (a *App) openForm(ag *agent.Agent, isNew bool) {
@@ -257,31 +328,31 @@ func (a *App) confirmToggle() {
 	}
 	msg := "Are you sure you want to " + action + " @" + sel.ID + "?"
 	title := "Confirm " + action
-	a.confirm = newConfirm(title, msg, func() {
-		a.toggleSelected()
+	a.confirm = newConfirm(title, msg, func() tea.Cmd {
+		return a.toggleSelected()
 	})
 	a.confirm.width = a.width
 	a.confirm.height = a.height
 }
 
-func (a *App) toggleSelected() {
+func (a *App) toggleSelected() tea.Cmd {
 	sel := a.list.selected()
 	if sel == nil {
-		return
+		return nil
 	}
 	sel.Disable = !sel.Disable
 	if err := sel.Save(); err != nil {
 		a.statusMsg = err.Error()
 		a.statusErr = true
-	} else {
-		if sel.Disable {
-			a.statusMsg = "@" + sel.ID + " disabled"
-		} else {
-			a.statusMsg = "@" + sel.ID + " enabled"
-		}
-		a.statusErr = false
+		return nil
 	}
-	a.reloadAgents()
+	if sel.Disable {
+		a.statusMsg = "@" + sel.ID + " disabled"
+	} else {
+		a.statusMsg = "@" + sel.ID + " enabled"
+	}
+	a.statusErr = false
+	return a.reloadAgents()
 }
 
 func (a *App) contentHeight() int {
@@ -379,10 +450,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.lastStateVersion = currentVersion
 			}
 
-			if a.pool.HasActiveAgents() {
+			hasActive, activeSessions, activeAgents := a.pool.ActiveState()
+			if hasActive {
 				if stateChanged {
-					activeSessions := a.pool.ActiveSessions()
-					a.activeAgents = a.pool.ActiveAgents()
+					a.activeAgents = activeAgents
 					a.dirsTab.activeSessions = activeSessions
 					a.dirsTab.rebuild()
 				}
@@ -411,17 +482,21 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Auto-remove instances that have been disconnected for ≥ 5 seconds.
 			// This must run every tick, not just on stateChanged, because the pool
 			// state version doesn't increment while waiting for the timeout to expire.
-			for _, srv := range a.pool.ConnectedServers() {
+			connectedServers := a.pool.ConnectedServers()
+			removed := false
+			for _, srv := range connectedServers {
 				if !srv.Connected && srv.DisconnectedAt != nil && time.Since(*srv.DisconnectedAt) >= 5*time.Second {
 					a.pool.Remove(srv.URL)
+					removed = true
 					stateChanged = true
 				}
 			}
 			if stateChanged {
-				// Refresh overview and dirs when state actually changed.
-				a.overviewTab.refresh(a.pool.ConnectedServers())
+				if removed {
+					connectedServers = a.pool.ConnectedServers()
+				}
+				a.overviewTab.refresh(connectedServers)
 			}
-			// Keep tick alive while pool is connected so state changes are caught promptly.
 			needsTick = true
 		}
 		if needsTick {
@@ -441,49 +516,104 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case sessionReloadMsg:
-		if sessions, err := session.LoadAll(); err == nil {
-			a.sessionTab.setSessions(sessions)
-			a.sessionTab.setSize(a.width, a.contentHeight())
-			a.dirsTab.allSessions = sessions
-			a.dirsTab.rebuild()
-			var connectedServers []server.ConnectedServerInfo
-			if a.pool != nil {
-				connectedServers = a.pool.ConnectedServers()
-			}
-			a.overviewTab.refresh(connectedServers)
-		}
-		return a, sessionReloadTick()
+		return a, tea.Batch(sessionReloadTick(), loadSessionsCmd())
 
 	case AgentChangedMsg:
-		a.reloadAgents()
-		return a, nil
+		return a, a.reloadAgents()
 
 	case SkillChangedMsg:
-		a.reloadSkills()
-		return a, nil
+		return a, a.reloadSkills()
 
 	case CommandChangedMsg:
-		a.reloadCommands()
-		return a, nil
+		return a, a.reloadCommands()
 
 	case ToolChangedMsg:
-		a.reloadTools()
+		return a, a.reloadTools()
+
+	case agentsLoadedMsg:
+		if msg.err != nil {
+			a.statusMsg = "reload error: " + msg.err.Error()
+			a.statusErr = true
+			return a, nil
+		}
+		a.list.setAgents(msg.agents)
+		if a.pendingSelectAgentID != "" {
+			for i, ag := range a.list.rows() {
+				if ag.kind == rowKindAgent && ag.agent != nil && ag.agent.ID == a.pendingSelectAgentID {
+					a.list.cursor = i
+					a.pendingSelectAgentID = ""
+					break
+				}
+			}
+		}
+		a.detail.setAgent(a.list.selected())
+		return a, nil
+
+	case skillsLoadedMsg:
+		if msg.err != nil {
+			a.statusMsg = "reload error: " + msg.err.Error()
+			a.statusErr = true
+			return a, nil
+		}
+		a.skillTab.skills = msg.skills
+		return a, nil
+
+	case commandsLoadedMsg:
+		if msg.err != nil {
+			a.statusMsg = "reload error: " + msg.err.Error()
+			a.statusErr = true
+			return a, nil
+		}
+		a.cmdTab.commands = msg.commands
+		return a, nil
+
+	case toolsLoadedMsg:
+		if msg.err != nil {
+			a.statusMsg = "reload error: " + msg.err.Error()
+			a.statusErr = true
+			return a, nil
+		}
+		a.toolTab.tools = msg.tools
+		return a, nil
+
+	case sessionsLoadedMsg:
+		if msg.err != nil {
+			return a, nil
+		}
+		a.sessionTab.setSessions(msg.sessions)
+		a.sessionTab.setSize(a.width, a.contentHeight())
+		a.dirsTab.allSessions = msg.sessions
+		a.dirsTab.rebuild()
+		var connectedServers []server.ConnectedServerInfo
+		if a.pool != nil {
+			connectedServers = a.pool.ConnectedServers()
+		}
+		a.overviewTab.refresh(connectedServers)
+		return a, nil
+
+	case permissionRespondedMsg:
+		if msg.err != nil {
+			a.statusMsg = "error: " + msg.err.Error()
+			a.statusErr = true
+		} else {
+			a.statusMsg = msg.permType + " " + msg.response + "d"
+			a.statusErr = false
+		}
+		a.detail.refreshContent()
 		return a, nil
 
 	case PermissionsChangedMsg:
 		a.list.cachedRows = nil // invalidate: approval row may have changed
 		a.detail.refreshContent()
-		if a.pool != nil && a.pool.HasActiveAgents() {
-			activeSessions := a.pool.ActiveSessions()
-			a.activeAgents = a.pool.ActiveAgents()
-			a.dirsTab.activeSessions = activeSessions
-			a.overviewTab.refresh(a.pool.ConnectedServers())
-		} else {
-			a.activeAgents = nil
-			a.dirsTab.activeSessions = nil
-			connectedServers := []server.ConnectedServerInfo(nil)
-			if a.pool != nil {
-				connectedServers = a.pool.ConnectedServers()
+		if a.pool != nil {
+			hasActive, activeSessions, activeAgents := a.pool.ActiveState()
+			connectedServers := a.pool.ConnectedServers()
+			if hasActive {
+				a.activeAgents = activeAgents
+				a.dirsTab.activeSessions = activeSessions
+			} else {
+				a.activeAgents = nil
+				a.dirsTab.activeSessions = nil
 			}
 			a.overviewTab.refresh(connectedServers)
 		}
@@ -504,6 +634,19 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case dirPickerSelectMsg:
 		return a, NewSessionInDirCmd(msg.dir)
 
+	case claudeLauncherSubmitMsg:
+		if err := a.pool.LaunchClaudeSession(msg.prompt, msg.dir); err != nil {
+			a.statusMsg = "claude: " + err.Error()
+			a.statusErr = true
+			return a, nil
+		}
+		a.statusMsg = "claude session launched"
+		a.statusErr = false
+		a.tab = tabOverview
+		a.pane = paneList
+		a.overviewTab.refresh(a.pool.ConnectedServers())
+		return a, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return clearStatusMsg{} })
+
 	case newSessionServeMsg:
 		if msg.err != nil {
 			a.statusMsg = "opencode error: " + msg.err.Error()
@@ -512,17 +655,30 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		a.statusMsg = ""
 		a.statusErr = false
-		// Add the new server to the pool if we got a URL.
+		a.tab = tabOverview
 		if msg.url != "" {
-			_ = a.pool.Add(msg.url)
+			pool := a.pool
+			url := msg.url
+			return a, func() tea.Msg {
+				err := pool.Add(url)
+				return sourceAddedMsg{url: url, err: err}
+			}
+		}
+		return a, nil
+
+	case sourceAddedMsg:
+		if msg.err != nil {
+			a.statusMsg = "opencode error: " + msg.err.Error()
+			a.statusErr = true
+			return a, nil
+		}
+		if msg.url != "" {
 			a.overviewTab.selectByURL(msg.url)
 		}
-		// Refresh overview so the new instance appears.
-		a.overviewTab.refresh(a.pool.ConnectedServers())
-		a.tab = tabOverview
-		// Attach to it so the user can interact with it.
+		if a.pool != nil {
+			a.overviewTab.refresh(a.pool.ConnectedServers())
+		}
 		if msg.url != "" {
-			// Create a lightweight tracked session to attach to.
 			c := exec.Command("opencode", "attach", msg.url)
 			return a, tea.ExecProcess(c, func(err error) tea.Msg {
 				return sessionOpenDoneMsg{err: err}
@@ -538,17 +694,11 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.statusMsg = ""
 			a.statusErr = false
 		}
-		// Immediately reload sessions so newly created sessions appear
-		if sessions, err := session.LoadAll(); err == nil {
-			a.sessionTab.setSessions(sessions)
-			a.sessionTab.setSize(a.width, a.contentHeight())
-			a.dirsTab.allSessions = sessions
-			a.dirsTab.rebuild()
-		}
-		// Switch to overview and auto-select the session that was just launched
 		a.tab = tabOverview
-		a.overviewTab.selectByURL(a.pool.LastAddedURL())
-		return a, nil
+		if a.pool != nil {
+			a.overviewTab.selectByURL(a.pool.LastAddedURL())
+		}
+		return a, loadSessionsCmd()
 
 	case tea.WindowSizeMsg:
 		a.width = msg.Width
@@ -630,7 +780,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if a.confirm.active {
 			switch msg.String() {
 			case "y", "Y":
-				a.confirm.confirm()
+				cmd := a.confirm.confirm()
+				return a, cmd
 			case "n", "N", "esc":
 				a.confirm.cancel()
 			}
@@ -656,6 +807,13 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if a.dirPicker.active {
 			var cmd tea.Cmd
 			a.dirPicker, cmd = a.dirPicker.Update(msg)
+			return a, cmd
+		}
+
+		// Claude launcher overlay intercepts all keys when active
+		if a.claudeLauncher.active {
+			var cmd tea.Cmd
+			a.claudeLauncher, cmd = a.claudeLauncher.Update(msg)
 			return a, cmd
 		}
 
@@ -873,13 +1031,13 @@ func (a *App) updateAgentsTab(msg tea.Msg) tea.Cmd {
 				a.detail.focused = false
 
 			case a.detail.showApprovals && msg.String() == "y":
-				a.respondToSelectedApproval("once")
+				cmds = append(cmds, a.respondToSelectedApproval("once"))
 
 			case a.detail.showApprovals && msg.String() == "Y":
-				a.respondToSelectedApproval("always")
+				cmds = append(cmds, a.respondToSelectedApproval("always"))
 
 			case a.detail.showApprovals && msg.String() == "n":
-				a.respondToSelectedApproval("reject")
+				cmds = append(cmds, a.respondToSelectedApproval("reject"))
 
 			case a.detail.showApprovals && (msg.String() == "j" || msg.String() == "down"):
 				a.detail.approvalMoveDown()
@@ -945,14 +1103,8 @@ func (a *App) updateAgentsTab(msg tea.Msg) tea.Cmd {
 					} else {
 						a.statusMsg = "Saved @" + built.ID
 						a.statusErr = false
-						a.reloadAgents()
-						for i, ag := range a.list.agents {
-							if ag.ID == built.ID {
-								a.list.cursor = i
-								a.detail.setAgent(ag)
-								break
-							}
-						}
+						a.pendingSelectAgentID = built.ID
+						cmds = append(cmds, a.reloadAgents())
 						a.pane = paneList
 					}
 				}
@@ -1029,6 +1181,11 @@ func (a *App) execLeaderAction(action ActionID) tea.Cmd {
 		a.dirPicker.width = a.width
 		a.dirPicker.height = a.height
 
+	case ActionNewClaudeSession:
+		a.claudeLauncher = newClaudeLauncher()
+		a.claudeLauncher.width = a.width
+		a.claudeLauncher.height = a.height
+
 	case ActionSettings:
 		a.settings = newSettings(a.accentName, func(p AccentPalette) {
 			ApplyAccent(p)
@@ -1045,9 +1202,9 @@ func (a *App) execLeaderAction(action ActionID) tea.Cmd {
 		a.pane = paneList
 		if sel := a.overviewTab.selectedServer(); sel != nil {
 			a.pool.Remove(sel.URL)
-			a.overviewTab.connectedServers = a.pool.ConnectedServers()
-			if a.overviewTab.cursor >= len(a.overviewTab.connectedServers) {
-				a.overviewTab.cursor = max(0, len(a.overviewTab.connectedServers)-1)
+			a.overviewTab.refresh(a.pool.ConnectedServers())
+			if a.overviewTab.cursor >= len(a.overviewTab.cachedOrdered) {
+				a.overviewTab.cursor = max(0, len(a.overviewTab.cachedOrdered)-1)
 			}
 			a.statusMsg = "removed " + sel.URL
 			a.statusErr = false
@@ -1112,22 +1269,22 @@ func (a *App) saveSettings() error {
 	})
 }
 
-func (a *App) respondToSelectedApproval(response string) {
+func (a *App) respondToSelectedApproval(response string) tea.Cmd {
 	if a.pool == nil {
-		return
+		return nil
 	}
 	p := a.detail.selectedApproval()
 	if p == nil {
-		return
+		return nil
 	}
-	if err := a.pool.Respond(p.SessionID, p.ID, response); err != nil {
-		a.statusMsg = "error: " + err.Error()
-		a.statusErr = true
-	} else {
-		a.statusMsg = p.Type + " " + response + "d"
-		a.statusErr = false
+	pool := a.pool
+	sid := p.SessionID
+	pid := p.ID
+	permType := p.Type
+	return func() tea.Msg {
+		err := pool.Respond(sid, pid, response)
+		return permissionRespondedMsg{permType: permType, response: response, err: err}
 	}
-	a.detail.refreshContent()
 }
 
 func (a *App) openPromptView(ag *agent.Agent) {
@@ -1223,8 +1380,7 @@ func (a *App) handleListClick(x, y int) {
 		if relY >= 0 && relY < len(a.overviewTab.rowToCursor) {
 			idx := a.overviewTab.rowToCursor[relY]
 			if idx >= 0 {
-				ordered := orderedServers(a.overviewTab.connectedServers)
-				if idx < len(ordered) {
+				if idx < len(a.overviewTab.cachedOrdered) {
 					a.overviewTab.cursor = idx
 					a.overviewTab.refreshDetail()
 					a.pane = paneList
@@ -1255,56 +1411,70 @@ func (a *App) handleListClick(x, y int) {
 func (a *App) renderTabBar() string {
 	sep := StyleDim.Render("·")
 	joinSep := "  " + sep + "  "
+	sepW := tabSepW
+	active := int(a.tab)
+	tc := int(tabCount)
 
-	// Pass 0: full form
+	// Compute total width for each pass using precomputed label lengths.
+	// Pass 0: full labels, active gets [LABEL].
+	pass0W := 2 // brackets for active
+	for i := 0; i < tc; i++ {
+		pass0W += tabLabelLens[i]
+	}
+	pass0W += (tc - 1) * sepW
+
+	// Pass 1: inactive tabs abbreviated to 1 char, active stays full.
+	pass1W := tabLabelLens[active] + 2 + (tc - 1) + (tc-1)*sepW
+
+	// Pass 2: all tabs abbreviated, active gets [A].
+	pass2W := 3 + (tc - 1) + (tc-1)*sepW
+
 	var tabs []string
-	for i := tabID(0); i < tabCount; i++ {
-		label := strings.TrimSpace(tabNames[i])
-		if i == a.tab {
-			tabs = append(tabs, StyleTabActive.Render("["+label+"]"))
-		} else {
-			tabs = append(tabs, StyleTabInactive.Render(label))
-		}
-	}
-	bar := strings.Join(tabs, joinSep)
+	var bar string
 
-	// Pass 1: shrink inactive tabs to first char only
-	if lipgloss.Width(bar) > a.width {
-		tabs = tabs[:0]
-		for i := tabID(0); i < tabCount; i++ {
-			label := strings.TrimSpace(tabNames[i])
-			if i == a.tab {
-				tabs = append(tabs, StyleTabActive.Render("["+label+"]"))
+	switch {
+	case pass0W <= a.width:
+		for i := 0; i < tc; i++ {
+			if i == active {
+				tabs = append(tabs, StyleTabActive.Render("["+tabLabelStrs[i]+"]"))
 			} else {
-				abbrev := string([]rune(label)[0:1])
-				tabs = append(tabs, StyleTabInactiveHotkey.Render(abbrev))
+				tabs = append(tabs, StyleTabInactive.Render(tabLabelStrs[i]))
 			}
 		}
 		bar = strings.Join(tabs, joinSep)
-	}
 
-	// Pass 2: shrink active tab to [first char] only
-	if lipgloss.Width(bar) > a.width {
-		tabs = tabs[:0]
-		for i := tabID(0); i < tabCount; i++ {
-			label := strings.TrimSpace(tabNames[i])
-			abbrev := string([]rune(label)[0:1])
-			if i == a.tab {
-				tabs = append(tabs, StyleTabActive.Render("["+abbrev+"]"))
+	case pass1W <= a.width:
+		for i := 0; i < tc; i++ {
+			if i == active {
+				tabs = append(tabs, StyleTabActive.Render("["+tabLabelStrs[i]+"]"))
 			} else {
-				tabs = append(tabs, StyleTabInactiveHotkey.Render(abbrev))
+				tabs = append(tabs, StyleTabInactiveHotkey.Render(tabAbbrevs[i]))
 			}
 		}
 		bar = strings.Join(tabs, joinSep)
+
+	case pass2W <= a.width:
+		for i := 0; i < tc; i++ {
+			if i == active {
+				tabs = append(tabs, StyleTabActive.Render("["+tabAbbrevs[i]+"]"))
+			} else {
+				tabs = append(tabs, StyleTabInactiveHotkey.Render(tabAbbrevs[i]))
+			}
+		}
+		bar = strings.Join(tabs, joinSep)
+
+	default:
+		for i := 0; i < tc; i++ {
+			if i == active {
+				tabs = append(tabs, StyleTabActive.Render("["+tabLabelStrs[i]+"]"))
+			} else {
+				tabs = append(tabs, StyleTabInactive.Render(tabLabelStrs[i]))
+			}
+		}
+		bar = lipgloss.NewStyle().MaxWidth(a.width).Render(strings.Join(tabs, joinSep))
 	}
 
-	// Pass 3: hard truncate if still too wide
-	if lipgloss.Width(bar) > a.width {
-		bar = lipgloss.NewStyle().MaxWidth(a.width).Render(bar)
-	}
-
-	// Compute tab click zones from the final tabs slice
-	sepW := lipgloss.Width(joinSep)
+	// Compute tab click zones from the final tabs slice.
 	x := 0
 	for i := tabID(0); i < tabCount; i++ {
 		w := lipgloss.Width(tabs[int(i)])
@@ -1421,6 +1591,11 @@ func (a *App) View() string {
 		return overlayModal(base, a.dirPicker.View(), a.width, 3)
 	}
 
+	// Overlay Claude launcher modal when active.
+	if a.claudeLauncher.active {
+		return overlayModal(base, a.claudeLauncher.View(), a.width, 3)
+	}
+
 	// Overlay finder modal when active.
 	if a.finder.active {
 		return overlayModal(base, a.finder.View(a.width, a.height), a.width, 3)
@@ -1535,8 +1710,8 @@ func (a *App) buildStatusBar() string {
 
 	var srvStr string
 	if a.pool != nil {
-		if a.pool.Connected() {
-			n := a.pool.ConnectedCount()
+		connected, n := a.pool.ConnectedStatus()
+		if connected {
 			if n > 1 {
 				srvStr = StyleBadgeEnabled.Render(fmt.Sprintf("[CONN:%d]", n)) + "  "
 			} else {

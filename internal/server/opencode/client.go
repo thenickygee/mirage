@@ -1,5 +1,4 @@
-
-package server
+package opencode
 
 import (
 	"bufio"
@@ -10,99 +9,29 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/thenickygee/mirage/internal/server"
+)
+
+// Type aliases for the shared session model so the existing client code can
+// reference TrackedSession / Permission / OutputLine unqualified. They are
+// identical to the server package types, so *Client satisfies server.Source.
+type (
+	TrackedSession = server.TrackedSession
+	Permission     = server.Permission
+	OutputLine     = server.OutputLine
 )
 
 // subagentTitleRe matches titles like "Explore project structure (@explore subagent)"
 var subagentTitleRe = regexp.MustCompile(`\(@([\w-]+)(?:\s+subagent)?\)`)
 
-// defaultSessionTitleRe matches opencode's auto-generated placeholder titles:
-// "New session - 2026-05-01T12:34:56.789Z" and "Child session - ..."
-var defaultSessionTitleRe = regexp.MustCompile(`^(?:New session|Child session) - \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$`)
-
-// isDefaultTitle reports whether s is an untitled opencode placeholder title.
-func isDefaultTitle(s string) bool {
-	return s == "" || defaultSessionTitleRe.MatchString(s)
-}
-
-// DisplaySessionTitle returns a cleaned title for display. Default placeholder
-// titles like "New session - 2026-..." are simplified to "New Session".
-func DisplaySessionTitle(title string) string {
-	if isDefaultTitle(title) {
-		return "New Session"
-	}
-	return title
-}
-
-type Permission struct {
-	ID        string                 `json:"id"`
-	Type      string                 `json:"type"`
-	Pattern   json.RawMessage        `json:"pattern,omitempty"`
-	SessionID string                 `json:"sessionID"`
-	MessageID string                 `json:"messageID"`
-	CallID    string                 `json:"callID,omitempty"`
-	Title     string                 `json:"title"`
-	Metadata  map[string]interface{} `json:"metadata,omitempty"`
-	Time      struct {
-		Created int64 `json:"created"`
-	} `json:"time"`
-}
-
-func (p *Permission) CreatedAt() time.Time {
-	return time.UnixMilli(p.Time.Created)
-}
-
-func (p *Permission) PatternString() string {
-	if len(p.Pattern) == 0 {
-		return ""
-	}
-	var s string
-	if json.Unmarshal(p.Pattern, &s) == nil {
-		return s
-	}
-	var arr []string
-	if json.Unmarshal(p.Pattern, &arr) == nil {
-		return strings.Join(arr, ", ")
-	}
-	return string(p.Pattern)
-}
-
 type sseEvent struct {
 	Type       string          `json:"type"`
 	Properties json.RawMessage `json:"properties"`
-}
-
-// OutputLine is a single rendered line tagged with the message role that
-// produced it ("user" or "assistant").
-type OutputLine struct {
-	Role string
-	Text string
-}
-
-// TrackedSession holds the live state of a session observed from a connected server.
-type TrackedSession struct {
-	ID              string
-	Title           string
-	Directory       string
-	AgentName       string
-	ModelID         string
-	ToolName        string
-	ToolState       string // state of the last tool (e.g. "running", "pending", "completed")
-	Busy            bool
-	WaitingForInput bool // true when idle but last tool is question/pending
-	LastActiveAt    time.Time
-	InputTokens     int64
-	OutputTokens    int64
-	CacheRead       int64
-	Cost            float64
-	MessageCount    int
-	OutputLines     []OutputLine // live rendered output from message parts
-	PendingCount    int          // number of pending permissions for this session
-	ContextWindow   int64        // model context window size in tokens (0 = unknown)
-	LastInputTokens int64        // input tokens from the most recent assistant message
-	LastCacheRead   int64        // cache read tokens from the most recent assistant message
 }
 
 type Client struct {
@@ -155,6 +84,44 @@ func New(baseURL string, onEvent func()) *Client {
 		cancel:        cancel,
 		isNewInstance: true,
 	}
+}
+
+// NewSource is a factory wrapper returning the client as a server.Source, used
+// by the Pool's source factory so the server package need not import opencode.
+func NewSource(baseURL string, onEvent func()) server.Source {
+	return New(baseURL, onEvent)
+}
+
+// ID returns the source's unique identifier (the OpenCode baseURL).
+func (c *Client) ID() string { return c.baseURL }
+
+// Kind returns the source kind, used for UI badges and routing.
+func (c *Client) Kind() string { return "opencode" }
+
+// OwnsSession reports whether this client tracks the given session.
+func (c *Client) OwnsSession(sessionID string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.sessions[sessionID]
+	return ok
+}
+
+// HasPermission reports whether this client holds the given pending permission.
+func (c *Client) HasPermission(permID string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.pending[permID]
+	return ok
+}
+
+// SetSessionOutputLines stores pre-fetched output lines on a tracked session.
+func (c *Client) SetSessionOutputLines(sessionID string, lines []OutputLine) {
+	c.mu.Lock()
+	if ts, ok := c.sessions[sessionID]; ok {
+		ts.OutputLines = lines
+	}
+	c.outputDirty[sessionID] = false
+	c.mu.Unlock()
 }
 
 func (c *Client) Connected() bool {
@@ -227,22 +194,12 @@ func (c *Client) TrackedSessions() []*TrackedSession {
 		out = append(out, &cp)
 	}
 	// Sort: busy first, then by most recently active
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0; j-- {
-			a, b := out[j-1], out[j]
-			swap := false
-			if a.Busy != b.Busy {
-				swap = !a.Busy && b.Busy
-			} else {
-				swap = a.LastActiveAt.Before(b.LastActiveAt)
-			}
-			if swap {
-				out[j-1], out[j] = out[j], out[j-1]
-			} else {
-				break
-			}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Busy != out[j].Busy {
+			return out[i].Busy
 		}
-	}
+		return out[i].LastActiveAt.Before(out[j].LastActiveAt)
+	})
 	return out
 }
 
@@ -286,7 +243,8 @@ func (c *Client) PendingCount() int {
 func (c *Client) Respond(sessionID, permissionID, response string) error {
 	body := fmt.Sprintf(`{"response":"%s"}`, response)
 	url := fmt.Sprintf("%s/session/%s/permissions/%s", c.baseURL, sessionID, permissionID)
-	resp, err := http.Post(url, "application/json", strings.NewReader(body))
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(url, "application/json", strings.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -1091,7 +1049,7 @@ func (c *Client) handleEvent(data []byte) {
 		// Track root sessions (no parentID) with their title and directory
 		if props.Info.ParentID == "" && props.Info.ID != "" {
 			c.mu.Lock()
-			if !isDefaultTitle(props.Info.Title) {
+			if !server.IsDefaultTitle(props.Info.Title) {
 				c.isNewInstance = false
 			}
 			if ts, ok := c.sessions[props.Info.ID]; ok {

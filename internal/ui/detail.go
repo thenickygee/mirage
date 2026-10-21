@@ -31,16 +31,35 @@ type detailPane struct {
 	height         int
 	focused        bool
 	lastKey        string
-	srv            *server.Client
 	pool           *server.Pool
+
+	// Markdown render cache — avoids re-running glamour on every refreshContent().
+	cachedDescMD   mdCache
+	cachedPromptMD mdCache
+}
+
+// mdCache caches a single glamour render result keyed by agent ID, width, and content.
+type mdCache struct {
+	agentID  string
+	width    int
+	content  string
+	rendered string
+}
+
+func (c *mdCache) get(content, agentID string, width int) string {
+	if c.agentID == agentID && c.width == width && c.content == content && c.rendered != "" {
+		return c.rendered
+	}
+	c.rendered = renderMarkdown(content, width)
+	c.agentID = agentID
+	c.width = width
+	c.content = content
+	return c.rendered
 }
 
 func (d *detailPane) pending() []*server.Permission {
 	if d.pool != nil {
 		return d.pool.Pending()
-	}
-	if d.srv != nil {
-		return d.srv.Pending()
 	}
 	return nil
 }
@@ -72,7 +91,7 @@ func (d *detailPane) approvalMoveUp() {
 }
 
 func (d *detailPane) approvalMoveDown() {
-	if d.pool == nil && d.srv == nil {
+	if d.pool == nil {
 		return
 	}
 	pending := d.pending()
@@ -83,7 +102,7 @@ func (d *detailPane) approvalMoveDown() {
 }
 
 func (d *detailPane) selectedApproval() *server.Permission {
-	if d.pool == nil && d.srv == nil {
+	if d.pool == nil {
 		return nil
 	}
 	pending := d.sortedPending()
@@ -363,7 +382,7 @@ func (d *detailPane) renderStatsTable(s *stats.AgentStats) string {
 }
 
 func (d *detailPane) renderApprovals() string {
-	if d.pool == nil && d.srv == nil {
+	if d.pool == nil {
 		return StyleMuted.Render("  no server connected")
 	}
 	pending := d.sortedPending()
@@ -480,7 +499,7 @@ func (d *detailPane) renderAgent() string {
 	if a.Description != "" {
 		sb.WriteString(StyleSectionHeader.Render("description") + "\n")
 		sb.WriteString(sep + "\n")
-		sb.WriteString(renderMarkdown(a.Description, d.viewport.Width) + "\n")
+		sb.WriteString(d.cachedDescMD.get(a.Description, a.ID, d.viewport.Width) + "\n")
 	}
 
 	// Usage stats
@@ -499,7 +518,7 @@ func (d *detailPane) renderAgent() string {
 	sb.WriteString(StyleSectionHeader.Render("system prompt") + "\n")
 	sb.WriteString(sep + "\n")
 	if a.Prompt != "" {
-		sb.WriteString(renderMarkdown(a.Prompt, d.viewport.Width) + "\n")
+		sb.WriteString(d.cachedPromptMD.get(a.Prompt, a.ID, d.viewport.Width) + "\n")
 	} else {
 		sb.WriteString(StyleMuted.Render("  (no system prompt defined)") + "\n\n")
 	}

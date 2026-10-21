@@ -37,7 +37,9 @@ internal/
 ├── agent/                 # Agent .md config load/save
 ├── command/               # Custom command definitions
 ├── config/                # XDG paths, user settings
-├── server/                # SSE client, connection pool, mDNS discovery
+├── server/                # Source interface, connection pool, shared session model
+│   ├── opencode/          # OpenCode HTTP + SSE client + mDNS discovery (implements server.Source)
+│   └── claude/             # Claude Code subprocess source (claude -p --output-format stream-json)
 ├── session/               # Local session history
 ├── skill/                 # Skill definitions
 ├── stats/                 # Agent usage statistics
@@ -117,9 +119,9 @@ Go files in this repo: only add header to new server/infrastructure files if app
 
 - **Bubble Tea (Elm) pattern:** single `App` model with `Init()`, `Update(msg)`, `View()`
 - Sub-components have their own `Update`/`View` methods composed into the main app
-- The app connects to one or more OpenCode servers via SSE
-- mDNS auto-discovery for local servers
-- Permission prompts forwarded from server to TUI for user approval
+- **Sources (`server.Source` interface):** the `Pool` holds `map[string]Source` and reaches into backends only via the interface. `internal/server/opencode` (HTTP + SSE + mDNS) and `internal/server/claude` (`claude -p` subprocesses) both implement it. Shared types (`TrackedSession`, `Permission`, `OutputLine`) live in package `server`. `opencode` imports `server` (shared types); `server` never imports `opencode` (factory injection via `SetSourceFactory` breaks the cycle). Claude sources are added with `pool.AddSource`; OpenCode HTTP sources with `pool.Add` (which uses the factory). `pool.NotifyChange` is the public state-version bump + redraw hook for non-HTTP sources.
+- mDNS auto-discovery for local OpenCode servers
+- Permission prompts forwarded from server to TUI for user approval (Claude source is no-op until Phase 4)
 
 ## Style Rules
 

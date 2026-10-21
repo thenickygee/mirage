@@ -240,6 +240,13 @@ var (
 	StyleBadgeTool = lipgloss.NewStyle().
 			Foreground(colorAsh)
 
+	// Source-kind badges for the instances overview (OC = opencode, CC = claude).
+	StyleBadgeSourceOC = lipgloss.NewStyle().
+				Foreground(colorAmber)
+
+	StyleBadgeSourceCC = lipgloss.NewStyle().
+				Foreground(colorSlate)
+
 	// Leader panel (bottom strip)
 	StyleLeaderPanelBg = lipgloss.NewStyle().
 				Background(colorDeep).

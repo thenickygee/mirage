@@ -28,6 +28,7 @@ const (
 	ActionFuzzyFind
 	ActionSettings
 	ActionNewSession
+	ActionNewClaudeSession
 	ActionKillInstance
 	ActionToggleListOnly
 	ActionToggleShowCtx
@@ -68,6 +69,7 @@ var actionsSection = menuSection{
 	title: "ACTIONS",
 	entries: []menuEntry{
 		{key: "n", label: "new session", action: ActionNewSession},
+		{key: "N", label: "new claude session", action: ActionNewClaudeSession},
 		{key: "f", label: "find", action: ActionFuzzyFind},
 		{key: "O", label: "options", action: ActionSettings},
 		{key: "q", label: "quit", action: ActionQuit},

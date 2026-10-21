@@ -1,5 +1,4 @@
-
-package server
+package opencode
 
 import (
 	"context"
@@ -11,6 +10,8 @@ import (
 	"time"
 
 	"github.com/hashicorp/mdns"
+
+	"github.com/thenickygee/mirage/internal/server"
 )
 
 const (
@@ -23,7 +24,7 @@ var silentLogger = log.New(io.Discard, "", 0)
 
 // Discover continuously scans for OpenCode instances via mDNS and adds them
 // to the pool. It runs until ctx is cancelled.
-func Discover(ctx context.Context, pool *Pool) {
+func Discover(ctx context.Context, pool *server.Pool) {
 	scan := func() {
 		urls := findOpenCodeInstances()
 		for _, u := range urls {
