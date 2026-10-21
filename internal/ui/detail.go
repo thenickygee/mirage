@@ -451,7 +451,7 @@ func (d *detailPane) renderAgent() string {
 	if a.Source == agent.SourceBuiltin {
 		builtinBadge = "  " + StyleBadgeBuiltin.Render("[builtin]")
 	}
-	sb.WriteString(title + "  " + statusBadge + modeBadge + builtinBadge + "\n")
+	sb.WriteString(title + "  " + statusBadge + modeBadge + builtinBadge + originDetail(a.Origin) + "\n")
 	sb.WriteString(sep + "\n\n")
 
 	// Config fields table
@@ -478,6 +478,9 @@ func (d *detailPane) renderAgent() string {
 	}
 	if a.Color != "" {
 		configRows = append(configRows, [2]string{"color", a.Color})
+	}
+	if tools := agentTools(a); tools != "" {
+		configRows = append(configRows, [2]string{"tools", tools})
 	}
 	configRows = append(configRows,
 		[2]string{"temperature", temp},
@@ -709,4 +712,20 @@ func truncate(s string, maxLen int) string {
 		return string(runes[:maxLen])
 	}
 	return string(runes[:maxLen-1]) + "…"
+}
+
+// agentTools renders a Claude Code agent's `tools` frontmatter, which may be a
+// comma-separated string or a YAML list.
+func agentTools(a *agent.Agent) string {
+	switch t := a.Extra["tools"].(type) {
+	case string:
+		return t
+	case []any:
+		parts := make([]string, 0, len(t))
+		for _, v := range t {
+			parts = append(parts, fmt.Sprint(v))
+		}
+		return strings.Join(parts, ", ")
+	}
+	return ""
 }

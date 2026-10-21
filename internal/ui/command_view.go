@@ -87,6 +87,9 @@ func (v *commandView) renderCommand(c *command.Command) string {
 
 	// Badges
 	badges := []string{StyleBadgeCommand.Render(" COMMAND ")}
+	if o := originDetail(c.Origin); o != "" {
+		badges = append(badges, strings.TrimSpace(o))
+	}
 	if c.Subtask {
 		badges = append(badges, StyleBadgeSubtask.Render(" SUBTASK "))
 	}
@@ -110,6 +113,12 @@ func (v *commandView) renderCommand(c *command.Command) string {
 	}
 	if c.Model != "" {
 		sb.WriteString(field("MODEL", c.Model))
+	}
+	if c.ArgumentHint != "" {
+		sb.WriteString(field("ARGS", string(c.ArgumentHint)))
+	}
+	if c.AllowedTools != "" {
+		sb.WriteString(field("TOOLS", string(c.AllowedTools)))
 	}
 
 	sb.WriteString("\n")
@@ -293,6 +302,7 @@ func (v commandView) renderList() string {
 		if c.Subtask {
 			label += "  " + StyleDim.Render("↪")
 		}
+		label += listOriginSuffix(c.Origin, i == v.cursor)
 		rows = append(rows, rowStyle.Width(innerW).Render(label))
 	}
 

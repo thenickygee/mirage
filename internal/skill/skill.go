@@ -6,66 +6,75 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"gopkg.in/yaml.v3"
 
-	"github.com/thenickygee/mirage/internal/config"
+	"github.com/thenickygee/mirage/internal/harness"
 )
 
 type Skill struct {
 	// Derived from directory name
-	ID   string
-	Path string // path to SKILL.md
+	ID     string         `yaml:"-"`
+	Path   string         `yaml:"-"` // path to SKILL.md
+	Origin harness.Origin `yaml:"-"`
 
 	// Frontmatter
-	Name          string            `yaml:"name"`
-	Description   string            `yaml:"description"`
-	License       string            `yaml:"license,omitempty"`
-	Compatibility string            `yaml:"compatibility,omitempty"`
-	AllowedTools  string            `yaml:"allowed-tools,omitempty"`
-	Metadata      map[string]string `yaml:"metadata,omitempty"`
+	Name          string             `yaml:"name"`
+	Description   string             `yaml:"description"`
+	License       string             `yaml:"license,omitempty"`
+	Compatibility string             `yaml:"compatibility,omitempty"`
+	AllowedTools  harness.FlexString `yaml:"allowed-tools,omitempty"`
+	Metadata      map[string]any     `yaml:"metadata,omitempty"`
+
+	// Extra preserves frontmatter keys mirage has no field for (Claude Code
+	// adds several) so saving doesn't drop them.
+	Extra map[string]any `yaml:",inline"`
 
 	// Body
-	Content string
-}
-
-func SkillsDir() (string, error) {
-	return config.SkillsDir()
+	Content string `yaml:"-"`
 }
 
 func LoadAll() ([]*Skill, error) {
-	dir, err := SkillsDir()
-	if err != nil {
-		return nil, err
+	var skills []*Skill
+	var errs []error
+	for _, root := range harness.Roots(harness.Skills) {
+		found, rootErrs := loadRoot(root)
+		skills = append(skills, found...)
+		errs = append(errs, rootErrs...)
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("reading skills dir: %w", err)
+	if len(errs) > 0 {
+		return skills, fmt.Errorf("%d skill(s) failed to load: %w", len(errs), errs[0])
 	}
+	return skills, nil
+}
 
+func loadRoot(root harness.Root) ([]*Skill, []error) {
+	entries, err := os.ReadDir(root.Dir)
+	if err != nil {
+		return nil, []error{fmt.Errorf("reading skills dir: %w", err)}
+	}
 	var skills []*Skill
 	var errs []error
 	for _, e := range entries {
 		if !e.IsDir() && e.Type()&os.ModeSymlink == 0 {
 			continue
 		}
-		skillPath := filepath.Join(dir, e.Name(), "SKILL.md")
+		skillPath := filepath.Join(root.Dir, e.Name(), "SKILL.md")
 		s, loadErr := Load(skillPath)
+		if os.IsNotExist(loadErr) {
+			continue
+		}
 		if loadErr != nil {
 			errs = append(errs, fmt.Errorf("loading %s: %w", e.Name(), loadErr))
 			continue
 		}
+		s.Origin = root.Origin
+		if root.Plugin != "" {
+			s.ID = root.Plugin + ":" + s.ID
+		}
 		skills = append(skills, s)
 	}
-	if len(errs) > 0 {
-		return skills, fmt.Errorf("%d skill(s) failed to load: %w", len(errs), errs[0])
-	}
-	return skills, nil
+	return skills, errs
 }
 
 func Load(path string) (*Skill, error) {
@@ -99,79 +108,22 @@ func Load(path string) (*Skill, error) {
 	return s, nil
 }
 
-// Watch watches the skills directory for changes, calling onChange whenever a
-// file is created, written, removed, or renamed. Events are debounced so that
+// Watch watches every skills directory for changes, calling onChange whenever
+// a file is created, written, removed, or renamed. Events are debounced so that
 // a single save triggers only one call. Watch blocks until ctx is cancelled.
 func Watch(ctx context.Context, onChange func()) error {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return fmt.Errorf("creating watcher: %w", err)
-	}
-	defer func() { _ = watcher.Close() }()
-
-	dir, err := SkillsDir()
-	if err != nil {
-		return fmt.Errorf("resolving skills dir: %w", err)
-	}
-
-	if dirErr := watcher.Add(dir); dirErr != nil && !os.IsNotExist(dirErr) {
-		return fmt.Errorf("watching skills dir: %w", dirErr)
-	}
-
-	// Also watch each existing skill subdirectory so edits to SKILL.md trigger reloads.
-	if entries, readErr := os.ReadDir(dir); readErr == nil {
-		for _, e := range entries {
-			if !e.IsDir() && e.Type()&os.ModeSymlink == 0 {
-				continue
-			}
-			subdir := filepath.Join(dir, e.Name())
-			// Resolve symlinks so the watcher can watch the real path.
-			if resolved, resolveErr := filepath.EvalSymlinks(subdir); resolveErr == nil {
-				subdir = resolved
-			}
-			_ = watcher.Add(subdir)
-		}
-	}
-
-	var debounce *time.Timer
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case event, ok := <-watcher.Events:
-			if !ok {
-				return nil
-			}
-			if !event.Has(fsnotify.Write) && !event.Has(fsnotify.Create) &&
-				!event.Has(fsnotify.Remove) && !event.Has(fsnotify.Rename) {
-				continue
-			}
-			// When a new skill subdirectory is created, start watching it.
-			if event.Has(fsnotify.Create) {
-				if info, statErr := os.Stat(event.Name); statErr == nil && info.IsDir() {
-					_ = watcher.Add(event.Name)
-				}
-			}
-			if debounce != nil {
-				debounce.Stop()
-			}
-			debounce = time.AfterFunc(300*time.Millisecond, onChange)
-		case _, ok := <-watcher.Errors:
-			if !ok {
-				return nil
-			}
-		}
-	}
+	return harness.WatchRoots(ctx, harness.Skills, onChange)
 }
 
 func (s *Skill) Save() error {
 	type frontmatter struct {
-		Name          string            `yaml:"name"`
-		Description   string            `yaml:"description"`
-		License       string            `yaml:"license,omitempty"`
-		Compatibility string            `yaml:"compatibility,omitempty"`
-		AllowedTools  string            `yaml:"allowed-tools,omitempty"`
-		Metadata      map[string]string `yaml:"metadata,omitempty"`
+		Name          string             `yaml:"name"`
+		Description   string             `yaml:"description"`
+		License       string             `yaml:"license,omitempty"`
+		Compatibility string             `yaml:"compatibility,omitempty"`
+		AllowedTools  harness.FlexString `yaml:"allowed-tools,omitempty"`
+		Metadata      map[string]any     `yaml:"metadata,omitempty"`
+		Extra         map[string]any     `yaml:",inline"`
 	}
 
 	fm := frontmatter{
@@ -181,6 +133,7 @@ func (s *Skill) Save() error {
 		Compatibility: s.Compatibility,
 		AllowedTools:  s.AllowedTools,
 		Metadata:      s.Metadata,
+		Extra:         s.Extra,
 	}
 
 	enc, err := yaml.Marshal(fm)

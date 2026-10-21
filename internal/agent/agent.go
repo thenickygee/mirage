@@ -11,12 +11,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"gopkg.in/yaml.v3"
 
 	"github.com/thenickygee/mirage/internal/config"
+	"github.com/thenickygee/mirage/internal/harness"
 )
 
 // headerRe matches lines like "build (primary)" or "explore (subagent)"
@@ -37,21 +36,27 @@ const (
 
 // Agent represents an OpenCode agent configuration.
 type Agent struct {
-	ID          string
-	Path        string
-	Source      Source
-	Description string     `yaml:"description"`
-	Mode        string     `yaml:"mode"`
-	Model       string     `yaml:"model"`
-	Temperature *float64   `yaml:"temperature,omitempty"`
-	TopP        *float64   `yaml:"top_p,omitempty"`
-	Steps       *int       `yaml:"steps,omitempty"`
-	Color       string     `yaml:"color,omitempty"`
-	Hidden      bool       `yaml:"hidden,omitempty"`
-	Disable     bool       `yaml:"disable,omitempty"`
-	Skills      []string   `yaml:"skills,omitempty"`
-	Permission  Permission `yaml:"permission,omitempty"`
-	Prompt      string
+	ID          string         `yaml:"-"`
+	Path        string         `yaml:"-"`
+	Source      Source         `yaml:"-"`
+	Origin      harness.Origin `yaml:"-"`
+	Name        string         `yaml:"name,omitempty"`
+	Description string         `yaml:"description"`
+	Mode        string         `yaml:"mode"`
+	Model       string         `yaml:"model"`
+	Temperature *float64       `yaml:"temperature,omitempty"`
+	TopP        *float64       `yaml:"top_p,omitempty"`
+	Steps       *int           `yaml:"steps,omitempty"`
+	Color       string         `yaml:"color,omitempty"`
+	Hidden      bool           `yaml:"hidden,omitempty"`
+	Disable     bool           `yaml:"disable,omitempty"`
+	Skills      []string       `yaml:"skills,omitempty"`
+	Permission  Permission     `yaml:"permission,omitempty"`
+
+	// Extra preserves frontmatter keys mirage has no field for (Claude Code's
+	// tools, permissionMode, ...) so saving doesn't drop them.
+	Extra  map[string]any `yaml:",inline"`
+	Prompt string         `yaml:"-"`
 }
 
 // AgentsDir returns the path to the agents configuration directory.
@@ -60,35 +65,51 @@ func AgentsDir() (string, error) {
 }
 
 func loadFromFiles() ([]*Agent, error) {
-	dir, err := AgentsDir()
-	if err != nil {
-		return nil, err
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("reading agents dir: %w", err)
-	}
-
 	var agents []*Agent
 	var errs []error
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
-			continue
-		}
-		a, loadErr := Load(filepath.Join(dir, e.Name()))
-		if loadErr != nil {
-			errs = append(errs, fmt.Errorf("loading %s: %w", e.Name(), loadErr))
-			continue
-		}
-		agents = append(agents, a)
+	for _, root := range harness.Roots(harness.Agents) {
+		found, rootErrs := loadRoot(root)
+		agents = append(agents, found...)
+		errs = append(errs, rootErrs...)
 	}
 	if len(errs) > 0 {
 		return agents, fmt.Errorf("%d agent(s) failed to load: %w", len(errs), errs[0])
 	}
 	return agents, nil
+}
+
+// loadRoot loads every .md file under root. Claude Code allows agents in
+// nested folders; OpenCode roots are read flat. Plugin agents are prefixed with
+// the plugin name so they can't collide with user agents.
+func loadRoot(root harness.Root) ([]*Agent, []error) {
+	var agents []*Agent
+	var errs []error
+	_ = filepath.WalkDir(root.Dir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if path != root.Dir && root.Harness != harness.Claude {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".md") {
+			return nil
+		}
+		a, loadErr := Load(path)
+		if loadErr != nil {
+			errs = append(errs, fmt.Errorf("loading %s: %w", d.Name(), loadErr))
+			return nil
+		}
+		a.Origin = root.Origin
+		if root.Plugin != "" {
+			a.ID = root.Plugin + ":" + a.ID
+		}
+		agents = append(agents, a)
+		return nil
+	})
+	return agents, errs
 }
 
 func Load(path string) (*Agent, error) {
@@ -98,8 +119,9 @@ func Load(path string) (*Agent, error) {
 	}
 
 	a := &Agent{
-		ID:   strings.TrimSuffix(filepath.Base(path), ".md"),
-		Path: path,
+		ID:     strings.TrimSuffix(filepath.Base(path), ".md"),
+		Path:   path,
+		Origin: harness.Origin{Harness: harness.OpenCode, Scope: harness.ScopeUser},
 	}
 
 	content := string(data)
@@ -128,6 +150,7 @@ func (a *Agent) Save() error {
 	buf.WriteString("---\n")
 
 	type frontmatter struct {
+		Name        string     `yaml:"name,omitempty"`
 		Description string     `yaml:"description,omitempty"`
 		Mode        string     `yaml:"mode,omitempty"`
 		Model       string     `yaml:"model,omitempty"`
@@ -139,9 +162,12 @@ func (a *Agent) Save() error {
 		Disable     bool       `yaml:"disable,omitempty"`
 		Skills      []string   `yaml:"skills,omitempty"`
 		Permission  Permission `yaml:"permission,omitempty"`
+
+		Extra map[string]any `yaml:",inline"`
 	}
 
 	fm := frontmatter{
+		Name:        a.Name,
 		Description: a.Description,
 		Mode:        a.Mode,
 		Model:       a.Model,
@@ -153,6 +179,7 @@ func (a *Agent) Save() error {
 		Disable:     a.Disable,
 		Skills:      a.Skills,
 		Permission:  a.Permission,
+		Extra:       a.Extra,
 	}
 
 	enc, err := yaml.Marshal(fm)
@@ -176,9 +203,10 @@ func New(id string) (*Agent, error) {
 		return nil, err
 	}
 	return &Agent{
-		ID:   id,
-		Path: filepath.Join(dir, id+".md"),
-		Mode: "subagent",
+		ID:     id,
+		Path:   filepath.Join(dir, id+".md"),
+		Mode:   "subagent",
+		Origin: harness.Origin{Harness: harness.OpenCode, Scope: harness.ScopeUser},
 	}, nil
 }
 
@@ -229,6 +257,7 @@ func LoadFromCLI() (map[string]*Agent, error) {
 				ID:     m[1],
 				Mode:   m[2],
 				Source: SourceBuiltin,
+				Origin: harness.Origin{Harness: harness.OpenCode, Scope: harness.ScopeUser},
 			}
 		} else if current != nil {
 			jsonLines = append(jsonLines, line)
@@ -293,60 +322,27 @@ func loadGlobalAgentsMD() (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
-// Watch watches the agents directory and global AGENTS.md for changes, calling
-// onChange whenever a file is created, written, removed, or renamed. Events are
-// debounced so that a single save triggers only one call. Watch blocks until ctx
-// is cancelled.
+// Watch watches every agents directory and the global AGENTS.md for changes,
+// calling onChange whenever a file is created, written, removed, or renamed.
+// Events are debounced so that a single save triggers only one call. Watch
+// blocks until ctx is cancelled.
 func Watch(ctx context.Context, onChange func()) error {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return fmt.Errorf("creating watcher: %w", err)
-	}
-	defer func() { _ = watcher.Close() }()
-
 	d, err := config.ResolveDirs()
 	if err != nil {
 		return fmt.Errorf("resolving dirs: %w", err)
 	}
 
-	// Watch the agents directory (catches new/edited/deleted agent .md files).
-	agentsDir := filepath.Join(d.Config, "agents")
-	if dirErr := watcher.Add(agentsDir); dirErr != nil && !os.IsNotExist(dirErr) {
-		return fmt.Errorf("watching agents dir: %w", dirErr)
-	}
-
-	// Watch the config root directory to catch AGENTS.md changes (watching a
-	// file directly breaks on atomic saves used by most editors).
-	configDir := d.Config
-	_ = watcher.Add(configDir)
-
-	globalMD := filepath.Join(configDir, "AGENTS.md")
-
-	var debounce *time.Timer
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case event, ok := <-watcher.Events:
-			if !ok {
-				return nil
-			}
-			if !event.Has(fsnotify.Write) && !event.Has(fsnotify.Create) &&
-				!event.Has(fsnotify.Remove) && !event.Has(fsnotify.Rename) {
-				continue
-			}
-			// For the config root directory, only react to AGENTS.md changes.
-			if filepath.Dir(event.Name) == configDir && event.Name != globalMD {
-				continue
-			}
-			if debounce != nil {
-				debounce.Stop()
-			}
-			debounce = time.AfterFunc(300*time.Millisecond, onChange)
-		case _, ok := <-watcher.Errors:
-			if !ok {
-				return nil
-			}
+	var dirs []string
+	for _, r := range harness.Roots(harness.Agents) {
+		if !r.ReadOnly() {
+			dirs = append(dirs, r.Dir)
 		}
 	}
+	// Watch the config root (not AGENTS.md itself) since atomic saves replace
+	// the file; only AGENTS.md events from it are relevant.
+	globalMD := filepath.Join(d.Config, "AGENTS.md")
+	accept := func(path string) bool {
+		return filepath.Dir(path) != d.Config || path == globalMD
+	}
+	return harness.WatchDirs(ctx, dirs, []string{d.Config}, accept, onChange)
 }

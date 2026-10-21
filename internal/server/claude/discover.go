@@ -206,6 +206,7 @@ func (s *Source) tailExternal(sid, path string, mtime, now time.Time) {
 		t.shown = true
 		s.mu.Unlock()
 		s.replayFile(t)
+		s.fireEvent()
 		return
 	}
 	s.mu.Unlock()
@@ -225,6 +226,7 @@ func (s *Source) tailExternal(sid, path string, mtime, now time.Time) {
 		t.residual = nil
 		s.mu.Unlock()
 		s.replayFile(t)
+		s.fireEvent()
 		return
 	}
 	s.replayFile(t)

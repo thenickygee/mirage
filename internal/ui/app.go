@@ -9,6 +9,7 @@ import (
 	"github.com/thenickygee/mirage/internal/agent"
 	"github.com/thenickygee/mirage/internal/command"
 	"github.com/thenickygee/mirage/internal/config"
+	"github.com/thenickygee/mirage/internal/harness"
 	"github.com/thenickygee/mirage/internal/server"
 	"github.com/thenickygee/mirage/internal/session"
 	"github.com/thenickygee/mirage/internal/skill"
@@ -311,6 +312,11 @@ func (a *App) reloadTools() tea.Cmd {
 }
 
 func (a *App) openForm(ag *agent.Agent, isNew bool) {
+	if ag != nil && ag.Origin.ReadOnly() {
+		a.statusMsg = "@" + ag.ID + " comes from the " + ag.Origin.Plugin + " plugin and is read-only"
+		a.statusErr = true
+		return
+	}
 	a.form = newForm(ag, isNew)
 	a.form.width = a.width
 	a.form.height = a.height
@@ -320,6 +326,11 @@ func (a *App) openForm(ag *agent.Agent, isNew bool) {
 func (a *App) confirmToggle() {
 	sel := a.list.selected()
 	if sel == nil {
+		return
+	}
+	if sel.Origin.Harness == harness.Claude {
+		a.statusMsg = "Claude Code agents can't be disabled from mirage"
+		a.statusErr = true
 		return
 	}
 	action := "disable"

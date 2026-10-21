@@ -440,6 +440,7 @@ func (l agentList) View(focused bool, activeAgents map[string]bool, spinFrame in
 		if a.Source == agent.SourceBuiltin {
 			label += " " + StyleMuted.Render("❖")
 		}
+		label += listOriginSuffix(a.Origin, i == l.cursor)
 		if activeAgents[a.ID] {
 			const pongWidth = 6
 			period := 2 * (pongWidth - 1)

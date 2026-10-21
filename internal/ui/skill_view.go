@@ -88,7 +88,7 @@ func (v *skillView) renderSkill(s *skill.Skill) string {
 	sb.WriteString(title + "\n")
 	sb.WriteString(StyleSeparator.Render(strings.Repeat("─", v.detail.Width)) + "\n\n")
 
-	sb.WriteString(StyleBadgeSkill.Render(" SKILL ") + "\n\n")
+	sb.WriteString(StyleBadgeSkill.Render(" SKILL ") + originDetail(s.Origin) + "\n\n")
 
 	field := func(label, value string) string {
 		if value == "" {
@@ -110,7 +110,7 @@ func (v *skillView) renderSkill(s *skill.Skill) string {
 		sb.WriteString(field("LICENSE", s.License))
 	}
 	if s.AllowedTools != "" {
-		sb.WriteString(field("ALLOWED TOOLS", s.AllowedTools))
+		sb.WriteString(field("ALLOWED TOOLS", string(s.AllowedTools)))
 	}
 
 	if len(s.Metadata) > 0 {
@@ -125,7 +125,7 @@ func (v *skillView) renderSkill(s *skill.Skill) string {
 		for _, k := range metaKeys {
 			fmt.Fprintf(&sb, "  %s  %s\n",
 				StyleMuted.Render(fmt.Sprintf("%-12s", k)),
-				StyleValue.Render(s.Metadata[k]),
+				StyleValue.Render(fmt.Sprint(s.Metadata[k])),
 			)
 		}
 	}
@@ -326,7 +326,7 @@ func (v skillView) renderList() string {
 		} else {
 			prefix = "  "
 		}
-		rows = append(rows, rowStyle.Width(innerW).Render(prefix+s.Name))
+		rows = append(rows, rowStyle.Width(innerW).Render(prefix+s.Name+listOriginSuffix(s.Origin, i == v.cursor)))
 	}
 
 	content := strings.Join(rows, "\n")
