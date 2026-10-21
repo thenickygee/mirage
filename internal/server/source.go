@@ -53,7 +53,7 @@ type Source interface {
 	FetchSessionOutputLines(sessionID string) ([]OutputLine, bool)
 	SetSessionOutputLines(sessionID string, lines []OutputLine)
 
-	// Permissions (no-op for Claude until Phase 4)
+	// Permissions
 	Pending() []*Permission
 	PendingForSession(sessionID string) []*Permission
 	PendingCount() int

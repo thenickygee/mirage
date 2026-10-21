@@ -2,11 +2,13 @@ package claude
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -26,17 +28,19 @@ type (
 // Config holds the launch defaults for Claude sessions, populated from main.go
 // flags. Zero values mean "let claude pick its default".
 type Config struct {
-	APIKey         string   // ANTHROPIC_API_KEY; falls back to $ANTHROPIC_API_KEY
+	Bare           bool     // run claude with --bare (API-key auth, no hooks/CLAUDE.md/plugins)
+	APIKey         string   // explicit ANTHROPIC_API_KEY; with Bare it falls back to $ANTHROPIC_API_KEY
 	Model          string   // optional --model override
-	PermissionMode string   // acceptEdits | dontAsk | default | ""
-	AllowedTools   []string // optional --allowedTools list
+	PermissionMode string   // acceptEdits | auto | dontAsk | plan | default | ""
+	AllowedTools   []string // optional --allowedTools list; anything else prompts via the UI
 	WorkingDir     string   // cwd for launched subprocesses
 	InitialPrompt  string   // optional: launch a session at startup (Phase 2 smoke test)
 }
 
 // Source implements server.Source for Claude Code sessions. Each session is a
-// separate `claude --bare -p … --output-format stream-json` subprocess whose
-// NDJSON stdout is parsed by parse.go into TrackedSession state. The source
+// separate `claude -p … --output-format stream-json` subprocess whose NDJSON
+// stdout is parsed by parse.go into TrackedSession state and whose stdin
+// answers tool permission prompts (permissions.go). The source
 // stays "connected" as long as the `claude` binary is on $PATH; per-session
 // subprocess death is tracked on the session, not the source.
 type Source struct {
@@ -50,7 +54,9 @@ type Source struct {
 	toolUseNames  map[string]string          // toolUseID -> tool name
 	outputDirty   map[string]bool            // sessionID -> true when new output since last fetch
 	streamingIdx  map[string]int             // sessionID -> in-progress streaming text line index (-1 via absence)
-	pending       map[string]*Permission     // always empty until Phase 4
+	pending       map[string]*Permission     // permissionID -> permission awaiting a UI answer
+	pendingReqs   map[string]*pendingRequest // permissionID -> context needed to answer it
+	queued        map[string][]string        // sessionID -> follow-ups waiting for the running turn
 	procs         map[string]*sessionProc    // sessionID -> running subprocess
 	pendingID     string                     // pre-generated UUID awaiting system/init confirmation
 
@@ -71,15 +77,6 @@ type Source struct {
 	external map[string]*externalTail
 }
 
-// sessionProc tracks one running `claude -p` subprocess.
-type sessionProc struct {
-	cmd        *exec.Cmd
-	cancel     context.CancelFunc
-	stderr     io.ReadCloser
-	errBuf     *strings.Builder // captured stderr for diagnostics
-	stderrDone chan struct{}    // closed when drainStderr finishes
-}
-
 // NewSource constructs a Claude Code source. Call AddSource on the pool to
 // register and Connect it.
 func NewSource(cfg Config, onEvent func()) *Source {
@@ -94,6 +91,8 @@ func NewSource(cfg Config, onEvent func()) *Source {
 		outputDirty:   make(map[string]bool),
 		streamingIdx:  make(map[string]int),
 		pending:       make(map[string]*Permission),
+		pendingReqs:   make(map[string]*pendingRequest),
+		queued:        make(map[string][]string),
 		procs:         make(map[string]*sessionProc),
 		external:      make(map[string]*externalTail),
 		isNewInstance: true,
@@ -169,7 +168,7 @@ func (s *Source) IsNewInstance() bool {
 // WorkingDir for this launch when non-empty (used by the UI launcher).
 func (s *Source) launchSession(prompt, resumeID, workingDir string) {
 	key := s.cfg.APIKey
-	if key == "" {
+	if key == "" && s.cfg.Bare {
 		key = os.Getenv("ANTHROPIC_API_KEY")
 	}
 	if workingDir == "" {
@@ -187,49 +186,27 @@ func (s *Source) launchSession(prompt, resumeID, workingDir string) {
 	}
 
 	res, err := launch(s.ctx, launchConfig{
-		Prompt:             prompt,
-		ResumeID:           resumeID,
-		SessionID:          sidFlag,
-		Model:              s.cfg.Model,
-		PermissionMode:     s.cfg.PermissionMode,
-		AllowedTools:       s.cfg.AllowedTools,
-		APIKey:             key,
-		WorkingDir:         workingDir,
-		AppendSystemPrompt: "",
+		Prompt:         prompt,
+		ResumeID:       resumeID,
+		SessionID:      sidFlag,
+		Model:          s.cfg.Model,
+		PermissionMode: s.cfg.PermissionMode,
+		AllowedTools:   s.cfg.AllowedTools,
+		Bare:           s.cfg.Bare,
+		APIKey:         key,
+		WorkingDir:     workingDir,
 	})
 	if err != nil {
-		s.mu.Lock()
-		if resumeID != "" {
-			// Follow-up launch failed: surface the error on the existing
-			// session rather than creating a phantom new one.
-			if ts, ok := s.sessions[resumeID]; ok {
-				ts.OutputLines = append(ts.OutputLines, OutputLine{
-					Role: "assistant",
-					Text: "✗ " + err.Error(),
-				})
-				s.outputDirty[resumeID] = true
-			}
-		} else {
-			s.sessions[sessionID] = &TrackedSession{
-				ID:        sessionID,
-				Title:     "Claude Session",
-				Directory: workingDir,
-				Busy:      false,
-				OutputLines: []OutputLine{{
-					Role: "assistant",
-					Text: "✗ " + err.Error(),
-				}},
-			}
-		}
-		s.mu.Unlock()
-		s.fireEvent()
+		s.recordLaunchFailure(err, sessionID, resumeID, workingDir)
 		return
 	}
+	proc := res.proc
 
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		_ = res.cmd.Process.Kill()
+		proc.cancel()
+		_ = proc.cmd.Wait()
 		return
 	}
 	if resumeID != "" {
@@ -266,47 +243,90 @@ func (s *Source) launchSession(prompt, resumeID, workingDir string) {
 	}
 	s.busySessions[sessionID] = true
 	s.isNewInstance = false
-	procCtx, procCancel := context.WithCancel(s.ctx)
-	proc := &sessionProc{
-		cmd:        res.cmd,
-		cancel:     procCancel,
-		stderr:     res.stderr,
-		errBuf:     &strings.Builder{},
-		stderrDone: make(chan struct{}),
-	}
 	s.procs[sessionID] = proc
 	s.mu.Unlock()
 	s.fireEvent()
 
 	// Drain stderr (diagnostics) in the background.
-	go s.drainStderr(sessionID, proc)
+	go s.drainStderr(proc)
 	// Scan stdout NDJSON and dispatch events.
-	go s.scanStdout(sessionID, procCtx, procCancel, res)
+	go s.scanStdout(sessionID, res)
+}
+
+// recordLaunchFailure surfaces a failed launch in the transcript so the user
+// sees why nothing happened.
+func (s *Source) recordLaunchFailure(err error, sessionID, resumeID, workingDir string) {
+	line := OutputLine{Role: "assistant", Text: "✗ " + err.Error()}
+	s.mu.Lock()
+	if resumeID != "" {
+		// Follow-up launch failed: surface the error on the existing
+		// session rather than creating a phantom new one.
+		delete(s.queued, resumeID)
+		if ts, ok := s.sessions[resumeID]; ok {
+			ts.OutputLines = append(ts.OutputLines, line)
+			s.outputDirty[resumeID] = true
+		}
+	} else {
+		s.sessions[sessionID] = &TrackedSession{
+			ID:          sessionID,
+			Title:       "Claude Session",
+			Directory:   workingDir,
+			OutputLines: []OutputLine{line},
+		}
+	}
+	s.mu.Unlock()
+	s.fireEvent()
+}
+
+// readLine returns the next non-empty NDJSON line. Unlike bufio.Scanner it has
+// no line-length cap: a single stream-json event (a large file read, say) can
+// exceed any fixed buffer, and giving up mid-stream would leave claude blocked
+// on a full pipe.
+func readLine(r *bufio.Reader) ([]byte, error) {
+	for {
+		line, err := r.ReadBytes('\n')
+		if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 {
+			return trimmed, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 }
 
 // scanStdout reads the claude subprocess's NDJSON stdout line-by-line and
-// dispatches each line to handleLine. On EOF or scanner error, it finalizes
-// the session if no result event was received (unexpected exit).
-func (s *Source) scanStdout(sessionID string, procCtx context.Context, procCancel context.CancelFunc, res *launchResult) {
-	defer procCancel()
-	scanner := bufio.NewScanner(res.stdout)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+// dispatches each line to handleLine. On EOF it finalizes the session if no
+// result event was received (unexpected exit), then starts any queued
+// follow-up turn.
+func (s *Source) scanStdout(sessionID string, res *launchResult) {
+	proc := res.proc
+	defer close(proc.done)
+	defer proc.cancel()
+	reader := bufio.NewReader(res.stdout)
 	sid := sessionID
-	for scanner.Scan() {
+	for {
+		line, err := readLine(reader)
+		if err != nil {
+			break
+		}
 		select {
 		case <-s.ctx.Done():
+			proc.cancel()
+			_ = proc.cmd.Wait()
 			return
 		default:
 		}
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		sid = s.handleLine(line, sid)
+		sid = s.handleLine(line, sid, proc)
 	}
-	// stdout closed: the process has exited. Wait for it and, if the session is
-	// still busy (no result event), mark it idle with an error.
-	exitErr := res.cmd.Wait()
+
+	// stdout closed: the process has exited. Give stderr a moment to drain so
+	// the captured text is complete, then reap it.
+	select {
+	case <-proc.stderrDone:
+	case <-time.After(2 * time.Second):
+	}
+	exitErr := proc.cmd.Wait()
+
 	s.mu.Lock()
 	ts, ok := s.sessions[sid]
 	stillBusy := ok && s.busySessions[sid]
@@ -315,60 +335,60 @@ func (s *Source) scanStdout(sessionID string, procCtx context.Context, procCance
 		ts.WaitingForInput = false
 		ts.ToolState = ""
 		ts.LastActiveAt = time.Now()
+		delete(s.busySessions, sid)
 	}
-	s.mu.Unlock()
-	// Wait for drainStderr to finish so errBuf has the complete stderr output.
-	s.mu.Lock()
-	proc := s.procs[sid]
-	s.mu.Unlock()
-	if proc != nil && proc.stderrDone != nil {
-		<-proc.stderrDone
+	stderrText := strings.TrimSpace(proc.errBuf.String())
+	if s.procs[sessionID] == proc {
+		delete(s.procs, sessionID)
 	}
-	s.mu.Lock()
-	var stderrText string
-	if proc != nil {
-		stderrText = strings.TrimSpace(proc.errBuf.String())
-	}
-	delete(s.procs, sid)
+	s.dropPendingLocked(proc)
 	s.mu.Unlock()
+
 	if stillBusy {
-		// Prefer stderr text (contains the real error message from claude)
-		// over exitErr.Error() which is just "exit status 1".
-		msg := stderrText
-		if msg == "" {
-			if exitErr != nil {
-				msg = exitErr.Error()
-			} else {
-				msg = "claude process exited unexpectedly"
-			}
+		s.recordUnexpectedExit(sid, stderrText, exitErr)
+	}
+	s.startQueued(sid)
+}
+
+// recordUnexpectedExit appends the reason claude exited without a result
+// event. Stderr is preferred over exitErr, which is just "exit status 1".
+func (s *Source) recordUnexpectedExit(sid, stderrText string, exitErr error) {
+	msg := stderrText
+	if msg == "" {
+		msg = "claude process exited unexpectedly"
+		if exitErr != nil {
+			msg = exitErr.Error()
 		}
-		s.mu.Lock()
-		if ts != nil {
-			ts.OutputLines = append(ts.OutputLines, OutputLine{
-				Role: "assistant",
-				Text: "✗ " + msg,
-			})
-			s.outputDirty[sid] = true
-		}
-		s.mu.Unlock()
-		s.fireEvent()
+	}
+	s.mu.Lock()
+	if ts, ok := s.sessions[sid]; ok {
+		ts.OutputLines = append(ts.OutputLines, OutputLine{Role: "assistant", Text: "✗ " + msg})
+		s.outputDirty[sid] = true
+	}
+	s.mu.Unlock()
+	s.fireEvent()
+}
+
+// startQueued launches the next follow-up that arrived while the previous turn
+// was still running.
+func (s *Source) startQueued(sid string) {
+	s.mu.Lock()
+	var next string
+	if q := s.queued[sid]; len(q) > 0 && !s.closed {
+		next = q[0]
+		s.queued[sid] = q[1:]
+	}
+	s.mu.Unlock()
+	if next != "" {
+		s.launchSession(next, sid, "")
 	}
 }
 
 // drainStderr copies the claude subprocess's stderr into the proc's errBuf for
 // later surfacing on unexpected exit.
-func (s *Source) drainStderr(sessionID string, proc *sessionProc) {
+func (s *Source) drainStderr(proc *sessionProc) {
 	defer close(proc.stderrDone)
-	buf := make([]byte, 4096)
-	for {
-		n, err := proc.stderr.Read(buf)
-		if n > 0 {
-			proc.errBuf.Write(buf[:n])
-		}
-		if err != nil {
-			return
-		}
-	}
+	_, _ = io.Copy(proc.errBuf, proc.stderr)
 }
 
 // --- Sessions ---
@@ -376,9 +396,16 @@ func (s *Source) drainStderr(sessionID string, proc *sessionProc) {
 func (s *Source) TrackedSessions() []*TrackedSession {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	pendingBySession := make(map[string]int, len(s.pending))
+	for _, p := range s.pending {
+		pendingBySession[p.SessionID]++
+	}
 	out := make([]*TrackedSession, 0, len(s.sessions))
 	for _, ts := range s.sessions {
 		cp := *ts
+		// Streaming deltas rewrite lines in place, so readers get their own copy.
+		cp.OutputLines = slices.Clone(ts.OutputLines)
+		cp.PendingCount = pendingBySession[cp.ID]
 		out = append(out, &cp)
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -466,20 +493,14 @@ func (s *Source) SetSessionOutputLines(sessionID string, lines []OutputLine) {
 	s.mu.Unlock()
 }
 
-// --- Permissions (no-op until Phase 4) ---
-
-func (s *Source) Pending() []*Permission                                 { return nil }
-func (s *Source) PendingForSession(string) []*Permission                 { return nil }
-func (s *Source) PendingCount() int                                      { return 0 }
-func (s *Source) HasPermission(string) bool                              { return false }
-func (s *Source) Respond(sessionID, permissionID, response string) error { return nil }
-
 // --- Messaging ---
 
 // SendMessage spawns a follow-up `claude -p --resume` run for an existing
 // session. The session flips back to Busy until the new run's result event.
-// Returns an error if the session is unknown or already busy (a claude
-// subprocess can't service two concurrent turns on one session).
+// A claude subprocess can't service two concurrent turns on one session, so a
+// message sent while Mirage's own turn is still running is queued and started
+// when that turn ends. A session busy in a claude process Mirage doesn't own
+// (an external terminal) can't be queued behind, so that is an error.
 func (s *Source) SendMessage(sessionID, text string) error {
 	if strings.TrimSpace(text) == "" {
 		return fmt.Errorf("claude SendMessage: empty message")
@@ -489,21 +510,36 @@ func (s *Source) SendMessage(sessionID, text string) error {
 		s.mu.Unlock()
 		return fmt.Errorf("claude source is closed")
 	}
-	_, ok := s.sessions[sessionID]
-	busy := s.busySessions[sessionID]
+	ts, ok := s.sessions[sessionID]
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("claude SendMessage: unknown session %q", sessionID)
+	}
+	if s.busySessions[sessionID] {
+		return s.queueLocked(ts, sessionID, text)
+	}
 	// If this is an externally discovered session (no Mirage subprocess),
 	// stop tailing its transcript file: the resume subprocess we're about to
 	// launch will own the stream, and we don't want the discoverer appending
 	// duplicate lines from the same jsonl.
 	delete(s.external, sessionID)
 	s.mu.Unlock()
-	if !ok {
-		return fmt.Errorf("claude SendMessage: unknown session %q", sessionID)
-	}
-	if busy {
-		return fmt.Errorf("claude SendMessage: session %q is already running", sessionID)
-	}
 	go s.launchSession(text, sessionID, "")
+	return nil
+}
+
+// queueLocked defers text until Mirage's running turn for the session ends. It
+// releases s.mu. Callers must hold s.mu.
+func (s *Source) queueLocked(ts *TrackedSession, sessionID, text string) error {
+	if _, owned := s.procs[sessionID]; !owned {
+		s.mu.Unlock()
+		return fmt.Errorf("claude SendMessage: session %q is busy in another claude process", sessionID)
+	}
+	s.queued[sessionID] = append(s.queued[sessionID], text)
+	ts.OutputLines = append(ts.OutputLines, OutputLine{Role: "user", Text: "⏳ queued until the current turn finishes"})
+	s.outputDirty[sessionID] = true
+	s.mu.Unlock()
+	s.fireEvent()
 	return nil
 }
 
@@ -537,6 +573,9 @@ func (s *Source) Close() {
 	s.connected = false
 	procs := s.procs
 	s.procs = make(map[string]*sessionProc)
+	s.pending = make(map[string]*Permission)
+	s.pendingReqs = make(map[string]*pendingRequest)
+	s.queued = make(map[string][]string)
 	s.external = make(map[string]*externalTail)
 	close(s.done)
 	s.cancel()
@@ -552,11 +591,17 @@ func (s *Source) Close() {
 		}
 	}
 
+	// Cancelling kills each subprocess; its scanStdout goroutine owns reaping
+	// it (a second cmd.Wait here would race), so just wait for that to finish.
+	deadline := time.After(2 * time.Second)
 	for _, proc := range procs {
 		proc.cancel()
-		if proc.cmd != nil && proc.cmd.Process != nil {
-			_ = proc.cmd.Process.Kill()
+	}
+	for _, proc := range procs {
+		select {
+		case <-proc.done:
+		case <-deadline:
+			return
 		}
-		_ = proc.cmd.Wait()
 	}
 }

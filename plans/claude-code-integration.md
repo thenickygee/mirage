@@ -1,3 +1,5 @@
+> **Status update:** this plan predates the shipped design. Permissions are implemented without an MCP server: each turn runs `claude -p --input-format stream-json --output-format stream-json --permission-prompt-tool stdio`, the prompt is sent on stdin, `can_use_tool` `control_request` lines become pending `Permission`s, and `Respond` writes a `control_response` (`allow` / `allow` + `updatedPermissions` / `deny`) back on stdin. `--bare` is opt-in (`-claude-bare`) instead of the default, so subscription logins, hooks and CLAUDE.md work out of the box. See `internal/server/claude/{launch,permissions}.go`.
+
 # Plan: Claude Code Integration (Option A — CLI Bridge)
 
 ## Goal

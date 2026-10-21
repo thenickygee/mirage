@@ -30,17 +30,38 @@ type streamEvent struct {
 
 	// result event fields. `result` is the final assistant text. `subtype` is
 	// "success" | "error" | "error_max_turns". `errors` carries detailed
-	// error messages when subtype is error_during_execution.
+	// error messages when subtype is error_during_execution. `is_error` is
+	// true for failures that still report subtype "success" (e.g. an invalid
+	// API key).
+	IsError      bool         `json:"is_error,omitempty"`
 	Result       string       `json:"result,omitempty"`
 	Errors       []string     `json:"errors,omitempty"`
 	TotalCostUSD float64      `json:"total_cost_usd,omitempty"`
 	Usage        *resultUsage `json:"usage,omitempty"`
 	DurationMS   int64        `json:"duration_ms,omitempty"`
 
+	// control_request / control_cancel_request carry a host-facing request
+	// (tool permission prompts) identified by request_id.
+	RequestID string          `json:"request_id,omitempty"`
+	Request   json.RawMessage `json:"request,omitempty"`
+
 	// stream_event carries a nested Anthropic API event in `event`. Its shape
 	// depends on the nested `type` (message_start, content_block_start,
 	// content_block_delta, content_block_stop, message_delta, message_stop).
 	Event json.RawMessage `json:"event,omitempty"`
+}
+
+// controlRequest is the `request` object inside a `control_request` line.
+// Only subtype "can_use_tool" is handled; any other subtype is answered with
+// an error response so claude never blocks waiting on us.
+type controlRequest struct {
+	Subtype               string          `json:"subtype"`
+	ToolName              string          `json:"tool_name,omitempty"`
+	DisplayName           string          `json:"display_name,omitempty"`
+	Input                 json.RawMessage `json:"input,omitempty"`
+	Description           string          `json:"description,omitempty"`
+	PermissionSuggestions json.RawMessage `json:"permission_suggestions,omitempty"`
+	ToolUseID             string          `json:"tool_use_id,omitempty"`
 }
 
 // streamEventEnvelope is the nested `event` object inside a top-level

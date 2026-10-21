@@ -18,8 +18,9 @@ import (
 // s.mu; onEvent is fired after each meaningful mutation so the Pool bumps its
 // state version and the UI redraws. Returns the session ID the line resolved
 // to (re-keyed by system/init if claude returns a different session_id than the
-// one we launched with).
-func (s *Source) handleLine(line []byte, sessionID string) string {
+// one we launched with). proc is the subprocess that produced the line; it is
+// used to answer control requests and to end the turn's stdin on result.
+func (s *Source) handleLine(line []byte, sessionID string, proc *sessionProc) string {
 	var evt streamEvent
 	if err := json.Unmarshal(line, &evt); err != nil {
 		// Non-JSON lines (e.g. stray stderr bleeding into stdout) are ignored.
@@ -35,8 +36,12 @@ func (s *Source) handleLine(line []byte, sessionID string) string {
 		s.handleUser(evt, sessionID)
 	case "stream_event":
 		s.handleStreamEvent(evt, sessionID)
+	case "control_request":
+		s.handleControlRequest(evt, sessionID, proc)
+	case "control_cancel_request":
+		s.handleControlCancel(evt)
 	case "result":
-		s.handleResult(evt, sessionID)
+		s.handleResult(evt, sessionID, proc)
 	default:
 		// Unknown top-level type: ignore (schema drift tolerance).
 	}
@@ -282,8 +287,15 @@ func (s *Source) handleStreamEvent(evt streamEvent, sessionID string) {
 
 // handleResult finalizes the session: clears Busy, records token/cost totals
 // from the authoritative result event, and appends an error line on failure.
-func (s *Source) handleResult(evt streamEvent, sessionID string) {
+func (s *Source) handleResult(evt streamEvent, sessionID string, proc *sessionProc) {
+	if proc != nil {
+		// The turn is over: EOF on stdin lets claude exit.
+		proc.closeStdin()
+	}
 	s.mu.Lock()
+	if proc != nil {
+		s.dropPendingLocked(proc)
+	}
 	ts, ok := s.sessions[sessionID]
 	if !ok {
 		s.mu.Unlock()
@@ -292,18 +304,14 @@ func (s *Source) handleResult(evt streamEvent, sessionID string) {
 	ts.Busy = false
 	ts.WaitingForInput = false
 	ts.ToolState = ""
-	if evt.Subtype != "success" && evt.Subtype != "" {
-		msg := evt.Result
-		if msg == "" && len(evt.Errors) > 0 {
-			msg = strings.Join(evt.Errors, "; ")
+	if failed := evt.IsError || (evt.Subtype != "success" && evt.Subtype != ""); failed {
+		msg := resultErrorMessage(evt)
+		if !recentlyShown(ts, msg) {
+			ts.OutputLines = append(ts.OutputLines, server.OutputLine{
+				Role: "assistant",
+				Text: "✗ " + msg,
+			})
 		}
-		if msg == "" {
-			msg = fmt.Sprintf("claude run ended: %s", evt.Subtype)
-		}
-		ts.OutputLines = append(ts.OutputLines, server.OutputLine{
-			Role: "assistant",
-			Text: "✗ " + msg,
-		})
 	}
 	if evt.Usage != nil {
 		ts.InputTokens = evt.Usage.InputTokens
@@ -323,6 +331,35 @@ func (s *Source) handleResult(evt streamEvent, sessionID string) {
 	s.outputDirty[sessionID] = true
 	s.mu.Unlock()
 	s.fireEvent()
+}
+
+// resultErrorMessage picks the most specific failure text on a result event.
+// Failures such as an invalid API key arrive with subtype "success" and
+// is_error set, so the subtype alone can't be trusted.
+func resultErrorMessage(evt streamEvent) string {
+	if evt.Result != "" {
+		return evt.Result
+	}
+	if len(evt.Errors) > 0 {
+		return strings.Join(evt.Errors, "; ")
+	}
+	return fmt.Sprintf("claude run ended: %s", evt.Subtype)
+}
+
+// recentlyShown reports whether msg is already in the last few transcript
+// lines, so a failure claude also emitted as an assistant message isn't
+// printed twice.
+func recentlyShown(ts *TrackedSession, msg string) bool {
+	lines := ts.OutputLines
+	if len(lines) > 5 {
+		lines = lines[len(lines)-5:]
+	}
+	for _, l := range lines {
+		if l.Text != "" && strings.Contains(msg, l.Text) {
+			return true
+		}
+	}
+	return false
 }
 
 // fireEvent is the post-mutation callback into the Pool's onEvent hook.

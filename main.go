@@ -46,18 +46,27 @@ Flags:
   -server <url>    OpenCode server URL (may be repeated)
   -no-mdns         Disable mDNS auto-discovery of OpenCode instances
   -claude          Force-enable the Claude Code source (otherwise auto-enabled
-                   when claude is on $PATH and ANTHROPIC_API_KEY is set)
-  -claude-key <key>    ANTHROPIC_API_KEY for claude --bare (else $ANTHROPIC_API_KEY)
+                   when claude is on $PATH)
+  -claude-bare     Run claude with --bare: API-key auth only, and skips hooks,
+                   plugins, CLAUDE.md and auto-memory. Needs -claude-key or
+                   $ANTHROPIC_API_KEY. Without it, claude uses its own login
+                   (subscription or API key) and your normal configuration.
+  -claude-key <key>    ANTHROPIC_API_KEY to pass to claude (with -claude-bare,
+                       falls back to $ANTHROPIC_API_KEY)
   -claude-model <id>   Default model (else claude's default)
-  -claude-mode <mode>  Permission mode: acceptEdits (default) | dontAsk | default
-  -claude-tools <list> Comma-separated --allowedTools (default "Read,Edit,Bash,Glob,Grep")
+  -claude-mode <mode>  Permission mode: acceptEdits (default) | auto | dontAsk |
+                       plan | default
+  -claude-tools <list> Comma-separated --allowedTools that run without asking
+                       (default "Read,Glob,Grep"); other tools prompt for
+                       approval in the Approvals view
   -claude-prompt <text>  Initial prompt to launch a Claude session at startup
 
 Examples:
   mirage
   mirage -server http://localhost:4096
   mirage -no-mdns -server http://localhost:4096
-  mirage -claude -claude-key $ANTHROPIC_API_KEY -claude-prompt "summarize this folder"
+  mirage -claude -claude-prompt "summarize this folder"
+  mirage -claude-bare -claude-key $ANTHROPIC_API_KEY
 `, version)
 }
 
@@ -81,10 +90,11 @@ func main() {
 	flag.Var(&serverURLs, "server", "opencode server URL (may be repeated, e.g. --server http://localhost:4096)")
 	noMDNS := flag.Bool("no-mdns", false, "disable mDNS auto-discovery of opencode instances")
 	claudeEnabled := flag.Bool("claude", false, "enable the Claude Code source")
-	claudeKey := flag.String("claude-key", "", "ANTHROPIC_API_KEY for `claude --bare` (else read from $ANTHROPIC_API_KEY)")
+	claudeBare := flag.Bool("claude-bare", false, "run claude with --bare (API-key auth, no hooks/plugins/CLAUDE.md)")
+	claudeKey := flag.String("claude-key", "", "ANTHROPIC_API_KEY to pass to claude (with -claude-bare, else read from $ANTHROPIC_API_KEY)")
 	claudeModel := flag.String("claude-model", "", "default model for claude sessions (else claude's default)")
-	claudeMode := flag.String("claude-mode", "acceptEdits", "permission mode for claude sessions: acceptEdits | dontAsk | default")
-	claudeTools := flag.String("claude-tools", "Read,Edit,Bash,Glob,Grep", "comma-separated --allowedTools list for claude sessions")
+	claudeMode := flag.String("claude-mode", "acceptEdits", "permission mode for claude sessions: acceptEdits | auto | dontAsk | plan | default")
+	claudeTools := flag.String("claude-tools", "Read,Glob,Grep", "comma-separated --allowedTools that run without approval; other tools prompt in the Approvals view")
 	claudePrompt := flag.String("claude-prompt", "", "initial prompt to launch a Claude session at startup")
 	flag.Usage = printHelp
 	flag.Parse()
@@ -109,30 +119,26 @@ func main() {
 		}
 	}
 
-	// Register the Claude Code source. It launches sessions as
-	// `claude --bare -p` subprocesses and parses the stream-json output. See
-	// plans/claude-code-integration.md.
+	// Register the Claude Code source. It launches sessions as `claude -p`
+	// subprocesses, parses the stream-json output, and answers tool permission
+	// prompts over stdin. See plans/claude-code-integration.md.
 	//
 	// Auto-enable whenever the `claude` CLI is on $PATH so mirage works with
 	// Claude and OpenCode simultaneously out of the box — the source stays
 	// out of the overview until it owns a session, so OpenCode-only users
 	// see no clutter. The -claude flag forces enable even when `claude`
 	// isn't on $PATH (to surface the missing-binary error explicitly).
-	// Launching without ANTHROPIC_API_KEY fails with a clear per-launch
-	// error rather than "no source available".
+	// Auth is claude's own login unless -claude-bare is set, in which case a
+	// missing key fails each launch with a clear error.
 	_, claudeLookErr := exec.LookPath("claude")
 	claudeOnPath := claudeLookErr == nil
 	if *claudeEnabled || claudeOnPath {
-		claudeKeyResolved := *claudeKey
-		if claudeKeyResolved == "" {
-			claudeKeyResolved = os.Getenv("ANTHROPIC_API_KEY")
-		}
-		tools := splitCSV(*claudeTools)
 		src := claude.NewSource(claude.Config{
-			APIKey:         claudeKeyResolved,
+			Bare:           *claudeBare,
+			APIKey:         *claudeKey,
 			Model:          *claudeModel,
 			PermissionMode: *claudeMode,
-			AllowedTools:   tools,
+			AllowedTools:   splitCSV(*claudeTools),
 			InitialPrompt:  *claudePrompt,
 		}, pool.NotifyChange)
 		if err := pool.AddSource(src); err != nil {
