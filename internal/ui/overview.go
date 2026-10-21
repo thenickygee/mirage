@@ -506,24 +506,32 @@ func (m overviewModel) Update(msg tea.Msg) (overviewModel, tea.Cmd) {
 	return m, nil
 }
 
-// OpenOverviewSessionCmd suspends the TUI and attaches to the running opencode
-// server at serverURL. If serverURL is empty it falls back to launching a new
-// opencode process for the given tracked session.
-func OpenOverviewSessionCmd(ts *server.TrackedSession, serverURL string) tea.Cmd {
+// OpenOverviewSessionCmd suspends the TUI and opens the session in its own
+// harness: `claude --resume` for Claude Code sessions, otherwise an attach to
+// the running opencode server at serverURL. If serverURL is empty it falls back
+// to launching a new opencode process for the given tracked session.
+func OpenOverviewSessionCmd(ts *server.TrackedSession, serverURL, kind string) tea.Cmd {
 	var c *exec.Cmd
-	if serverURL != "" {
+	switch {
+	case kind == "claude":
+		c = exec.Command("claude", "--resume", ts.ID)
+		c.Dir = sessionDir(ts.Directory)
+	case serverURL != "":
 		c = exec.Command("opencode", "attach", serverURL, "--session", ts.ID)
-	} else {
-		dir := ts.Directory
-		if dir == "" {
-			dir = "."
-		}
+	default:
 		c = exec.Command("opencode", "--mdns", "--session", ts.ID)
-		c.Dir = filepath.Clean(dir)
+		c.Dir = sessionDir(ts.Directory)
 	}
 	return tea.ExecProcess(c, func(err error) tea.Msg {
 		return sessionOpenDoneMsg{err: err}
 	})
+}
+
+func sessionDir(dir string) string {
+	if dir == "" {
+		dir = "."
+	}
+	return filepath.Clean(dir)
 }
 
 // sourceKindBadge returns a short tag ("OC"/"CC") identifying the source kind

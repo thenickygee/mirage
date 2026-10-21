@@ -912,11 +912,11 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tabOverview:
 			if !a.overviewTab.insertMode && key.Matches(msg, Keys.OpenSession) {
 				if sel := a.overviewTab.selected(); sel != nil {
-					serverURL := ""
+					serverURL, kind := "", ""
 					if srv := a.overviewTab.selectedServer(); srv != nil {
-						serverURL = srv.URL
+						serverURL, kind = srv.URL, srv.Kind
 					}
-					return a, OpenOverviewSessionCmd(sel, serverURL)
+					return a, OpenOverviewSessionCmd(sel, serverURL, kind)
 				}
 			} else {
 				var cmd tea.Cmd
